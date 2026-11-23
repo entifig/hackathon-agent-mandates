@@ -156,6 +156,5 @@ def test_eval_set_passes_against_template_gateway(gw, tmp_path):
         return r.status_code, r.json()
 
     results = ev.run_cases(tmp_path / "pack", post)
-    # questions 3 to 5 are the teams' build work, so only the starter's questions 0 to 2 must pass
-    assert [line for ok, line in results if not ok and line[:2] in {"Q0", "Q1", "Q2"}] == []
+    assert [line for ok, line in results if not ok] == []
     assert len(results) == len(ev.VALID) + len(ev.INVALID) + len(ev.BUILD)
