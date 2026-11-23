@@ -436,14 +436,86 @@ def test_aggregate_needs_same_clearance_as_direct_read(gw, tmp_path):
         )
         return call(client, "aggregate", body=body)[0]
 
-    # FSMeligible is level 3: clearance 2 denies (would also deny reading the column), 3 allows exact counts
+    # FSMeligible is level 3: clearance 2 denies (would also deny reading the column), 3 allows the counts,
+    # rounded to the nearest 10 (617 rows at SCH01)
     r = counts(2, "FSMeligible")
     assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "CLEARANCE_TOO_LOW")
     r = counts(3, "FSMeligible")
-    assert (r.status_code, r.json()["result"][0]["total"]) == (200, 617)
+    assert (r.status_code, r.json()["result"][0]["total"]) == (200, 620)
     # InCareAtCurrentSchool is level 4: clearance 3 is not enough, aggregated or read directly
     r = counts(3, "InCareAtCurrentSchool")
     assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "CLEARANCE_TOO_LOW")
+
+
+_COUNTS_SCOPE = [{"server": "pupil-data", "tools": ["aggregate"], "constraints": {"table": [ev.CENSUS]}}]
+
+
+def _aggregate(client, call, agent, mandate, **arguments):
+    args = {"table": ev.CENSUS, "measure": "FSMeligible", **arguments}
+    body = cli.sign_request(agent, server="pupil-data", tool="aggregate", arguments=args, mandate=mandate)
+    return call(client, "aggregate", body=body)[0]
+
+
+def test_counts_are_rounded_so_two_answers_cannot_be_subtracted(gw, tmp_path):
+    client, call, state = gw
+    agent = priv_from_pem((state / "agent.pem").read_bytes())
+    mandate = _issue(state, tmp_path / "counts.jwt", 4, _COUNTS_SCOPE)
+
+    def released(**arguments):
+        r = _aggregate(client, call, agent, mandate, **arguments)
+        assert r.status_code == 200, r.text
+        assert r.json()["decision"]["disclosure"] == {"rounded_to": 10}
+        return r.json()["result"]
+
+    # SCH02 has 74 meal rows, 69 of them WHIT: exact answers would give away the other 5
+    school = released(group_by=["URN"], where={"URN": "SCH02"})
+    whit = released(group_by=["URN"], where={"URN": "SCH02", "Ethnicity": "WHIT"})
+    assert (school[0]["count"], whit[0]["count"]) == (70, 70)
+    # every total and count is a multiple of 10, so no sum or difference of answers comes to 1-9
+    cells = released(group_by=["URN", "Ethnicity"])
+    assert all(cell["total"] % 10 == 0 and cell["count"] % 10 == 0 for cell in cells)
+
+
+def test_small_count_lives_in_the_gateway(gw, monkeypatch):
+    client, call, state = gw
+    agent = priv_from_pem((state / "agent.pem").read_bytes())
+    token, _ = cli.issue_mandate(
+        state,
+        agent.public_key(),
+        scope=_COUNTS_SCOPE,
+        deny=cli.DEFAULT_DENY,
+        ttl=3600,
+        purpose="counts",
+        principal="officer:jsmith",
+        org="school:SCH01",
+        extra={"clearance": 4, "small_count": 1},
+    )
+
+    def counts():
+        return [cell["count"] for cell in _aggregate(client, call, agent, token, group_by=["URN"]).json()["result"]]
+
+    # the issuer cannot lower the floor
+    assert all(count % 10 == 0 for count in counts())
+    # the gateway's own setting can
+    monkeypatch.setitem(main.state, "small_count", 1)
+    assert any(count % 10 for count in counts())
+
+
+def test_an_aggregate_cannot_single_out_a_pupil(gw, tmp_path):
+    client, call, state = gw
+    agent = priv_from_pem((state / "agent.pem").read_bytes())
+    mandate = _issue(state, tmp_path / "counts.jwt", 4, _COUNTS_SCOPE)
+    # each pupil has up to five census rows, so a group of one pupil would still round to 10
+    for arguments in ({"group_by": ["Psuedo ID"]}, {"group_by": ["URN"], "where": {"Psuedo ID": ev.PUPIL}}):
+        r = _aggregate(client, call, agent, mandate, **arguments)
+        assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "TOO_FINE"), arguments
+
+    # a filter is labelled like a column: one ethnic group's count needs the clearance for Ethnicity
+    mandate = _issue(state, tmp_path / "three.jwt", 3, _COUNTS_SCOPE)
+    r = _aggregate(client, call, agent, mandate, group_by=["URN"], where={"Ethnicity": "WHIT"})
+    d = r.json()["decision"]
+    assert (r.status_code, d["reason_code"]) == (403, "CLEARANCE_TOO_LOW")
+    assert d["sensitivity"]["decided_by"] == ["Ethnicity (filter)"]
 
 
 def test_eval_set_passes_against_template_gateway(gw, tmp_path):

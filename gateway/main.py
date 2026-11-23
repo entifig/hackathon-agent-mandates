@@ -18,7 +18,16 @@ from pydantic import BaseModel
 
 from gateway.cli import sign_request
 from gateway.lib.common import generate_keypair, pub_to_jwk
-from gateway.lib.gateway_verify import Gateway, Request, result_levels, sensitivity_maps, sensitivity_record
+from gateway.lib.gateway_verify import (
+    IDENTIFIERS,
+    SMALL_COUNT,
+    Gateway,
+    Request,
+    result_levels,
+    round_counts,
+    sensitivity_maps,
+    sensitivity_record,
+)
 from gateway.lib.trust_registry import TrustedList
 
 STATE_DIR = Path(os.environ.get("GATEWAY_STATE_DIR", "gateway/state"))
@@ -52,6 +61,15 @@ def load_state(state_dir: Path) -> None:
     state["dir"] = state_dir
     # Q6 labels live with the data; the gateway enforces them against results (deny on max)
     load_labels()
+    state["small_count"] = small_count_setting()
+
+
+def small_count_setting() -> int:
+    value = int(os.environ.get("GATEWAY_SMALL_COUNT", SMALL_COUNT))
+    if value < 1:
+        msg = f"GATEWAY_SMALL_COUNT must be at least 1, got {value}"
+        raise ValueError(msg)
+    return value
 
 
 def load_labels() -> None:
@@ -101,6 +119,11 @@ async def describe() -> dict:
     return {
         "servers": servers,
         "step_up_patterns": state["gateway"].step_up,
+        "disclosure": {
+            "small_count": state["small_count"],
+            "rule": "aggregate totals and counts are rounded to the nearest multiple of small_count",
+            "refused_in_aggregates": sorted(IDENTIFIERS),
+        },
         "signing": {
             "alg": "Ed25519 by the key in the mandate's cnf.jwk; sig is base64url without padding",
             "signing_input": "canonical JSON (sorted keys, separators ',' and ':', ensure_ascii=False) of "
@@ -151,7 +174,11 @@ async def tools_call(body: CallBody):
         decided_by = ", ".join(decision.sensitivity["decided_by"])
         decision.detail = f"result reaches sensitivity {level} above clearance {decision.clearance} ({decided_by})"
         return JSONResponse({"decision": decision.to_dict()}, status_code=403)
-    return {"decision": decision.to_dict(), "result": result.data}
+    data = result.data
+    if body.tool == "aggregate":
+        data = round_counts(data, state["small_count"])
+        decision.disclosure = {"rounded_to": state["small_count"]}
+    return {"decision": decision.to_dict(), "result": data}
 
 
 from gateway.demo import router as demo_router  # noqa: E402  (demo imports main lazily)
