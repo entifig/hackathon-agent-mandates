@@ -23,7 +23,14 @@ from pathlib import Path
 from gateway import eval as ev
 from gateway.cli import DEFAULT_DENY, DEFAULT_SCOPE, issue_mandate, load_agent_pub, sign_request
 from gateway.lib.common import b64u_decode, priv_from_pem
-from gateway.lib.gateway_verify import MAX_ROWS, result_levels, sensitivity_maps, sensitivity_record
+from gateway.lib.gateway_verify import (
+    IDENTIFIERS,
+    MAX_ROWS,
+    SMALL_COUNT,
+    result_levels,
+    sensitivity_maps,
+    sensitivity_record,
+)
 from gateway.main import _CLASSIFICATION_CANDIDATES
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +44,7 @@ TTL = 3 * 86400
 FRESH = 60  # a mandate with less left than this is renewed before a run
 HTTP_OK, HTTP_FORBIDDEN = 200, 403
 STEP_UP = ("*.write", "*.draft")  # the Gateway default in gateway_verify.py
+CELLS_SHOWN = 2  # an aggregate with this many rows or fewer is printed on its card
 LIVE = "live"
 _ISSUE = threading.Lock()  # issuing rewrites status_list.json, so one issue at a time
 
@@ -77,7 +85,7 @@ MANDATES: dict[str, dict] = {
             "purpose": "School-level counts for the local authority",
             "label": f"Counts, clearance {level}",
         }
-        for level in (2, 3, 4)
+        for level in (3, 4)
     },
 }
 _PACK_FIXTURES = {
@@ -160,9 +168,9 @@ _META: list[tuple[int, str, str, str, str, str]] = [
         8,
         "answered",
         "How many pupils in care does each school have, split by ethnic group?",
-        "A count carries the label of its measure, and each group_by key carries its own column's label, through the same check as question 6. So an aggregate needs the clearance it would take to read the same columns row by row. Free school meal counts by school need 3. Care counts, or any split by Ethnicity, need 4.",
-        "Unresolved: at clearance 4 the counts are exact and there is no minimum cell size, so a group of one is a pupil. The smallest group in the run shows how close that is. Rounding small counts was tried and dropped.",
-        "Free school meal counts are refused at clearance 2 and allowed at 3. Care counts are refused at 3. The question's own split, care by school and ethnic group, is refused at 3 and allowed at 4.",
+        "Both. Before the call, an aggregate grouped or filtered by Psuedo ID is refused as TOO_FINE, because each group would be one pupil. After the call the labels decide first: a count needs its measure's clearance, and each group_by key and where filter needs its own. Then the gateway rounds every total and count to the nearest 10, so a count below 10 comes out as 0 or 10. The large counts are rounded too, because that is what stops subtraction. Brookmere has 74 meal rows and 69 of them are WHIT, so two exact answers would give away the other 5. Rounded, both read 70. The floor is SMALL_COUNT in the gateway, 10 unless GATEWAY_SMALL_COUNT says otherwise, and no mandate claim changes it.",
+        "Unresolved: counts are census rows, and one pupil can be five of them, so one or two children can still round to 10. A where filter on enough other columns can still single out one pupil. Counting each pupil once, by naming one census per answer or counting distinct pupils in the gateway, would close both.",
+        "Free school meals by school are released, rounded to tens. Care by school and ethnic group is refused at clearance 3, and at clearance 4 every cell comes back as 0 or 10. Brookmere's count and its WHIT count both read 70, so subtracting them gives nothing away. Grouping by Psuedo ID is refused before the call.",
     ),
     (
         9,
@@ -266,15 +274,8 @@ _ANSWERED: dict[int, list[dict]] = {
     ],
     8: [
         {
-            "mandate": "counts-2",
-            "name": "free school meals by school, clearance 2",
-            "tool": "aggregate",
-            "arguments": _MEALS_BY_SCHOOL,
-            "expect": "CLEARANCE_TOO_LOW",
-        },
-        {
             "mandate": "counts-3",
-            "name": "free school meals by school, clearance 3",
+            "name": "free school meals by school",
             "tool": "aggregate",
             "arguments": _MEALS_BY_SCHOOL,
             "expect": "ALLOW",
@@ -292,6 +293,27 @@ _ANSWERED: dict[int, list[dict]] = {
             "tool": "aggregate",
             "arguments": _CARE_BY_SCHOOL_AND_ETHNICITY,
             "expect": "ALLOW",
+        },
+        {
+            "mandate": "counts-4",
+            "name": "Brookmere: free school meals",
+            "tool": "aggregate",
+            "arguments": {**_MEALS_BY_SCHOOL, "where": {"URN": "SCH02"}},
+            "expect": "ALLOW",
+        },
+        {
+            "mandate": "counts-4",
+            "name": "Brookmere: free school meals, WHIT pupils",
+            "tool": "aggregate",
+            "arguments": {**_MEALS_BY_SCHOOL, "where": {"URN": "SCH02", "Ethnicity": "WHIT"}},
+            "expect": "ALLOW",
+        },
+        {
+            "mandate": "counts-4",
+            "name": "free school meals grouped by pupil",
+            "tool": "aggregate",
+            "arguments": {"table": CENSUS, "group_by": ["Psuedo ID"], "measure": "FSMeligible"},
+            "expect": "TOO_FINE",
         },
     ],
     15: [
@@ -648,8 +670,8 @@ def _constraint_steps(constraints: dict, arguments: dict, steps: list[dict]) -> 
     return None
 
 
-def _allowed_steps(tool: str, arguments: dict, claims: dict, index: int, constraints: dict) -> list[dict]:
-    name = f"{SERVER}.{tool}"
+def _rule_steps(tool: str, arguments: dict) -> list[dict]:
+    """The gateway's own rules once an entry accepts the call. The last step fails when one refuses it."""
     steps = []
     if "limit" in arguments:
         limit = arguments["limit"]
@@ -663,8 +685,35 @@ def _allowed_steps(tool: str, arguments: dict, claims: dict, index: int, constra
         empty = not str(query).strip()
         verdict = "TOO_MUCH, it matches every row" if empty else "not empty"
         steps.append(_step("query", query, "not empty (a gateway rule)", verdict, "fail" if empty else "pass"))
-        if empty:
-            return steps
+    if tool == "aggregate":
+        group_by, where = arguments.get("group_by"), arguments.get("where")
+        fields = [*(group_by if isinstance(group_by, list) else []), *(where if isinstance(where, dict) else [])]
+        fields = list(dict.fromkeys(field for field in fields if isinstance(field, str)))
+        named = [field for field in fields if field in IDENTIFIERS]
+        verdict = f"TOO_FINE, each group would be one pupil ({named[0]})" if named else "no pupil id"
+        steps.append(_step("group_by, where", fields, sorted(IDENTIFIERS), verdict, "fail" if named else "pass"))
+    return steps
+
+
+def _label_steps(tool: str, arguments: dict, claims: dict) -> list[dict]:
+    expected = expected_labels(tool, arguments)
+    clearance = claims.get("clearance")
+    source = ", ".join(expected["decided_by"]) or "no labelled data"
+    value = f"level {expected['level']} from {source}"
+    if isinstance(clearance, int) and expected["level"] > clearance:
+        return [_step("labels", value, f"clearance {clearance}", "CLEARANCE_TOO_LOW, the result is dropped", "fail")]
+    steps = [_step("labels", value, f"clearance {clearance}", "within clearance, ALLOW", "allow")]
+    if tool == "aggregate":
+        nearest = f"the nearest {SMALL_COUNT} (SMALL_COUNT, a gateway setting)"
+        steps.append(_step("rounding", "every total and count", nearest, "rounded before release", "pass"))
+    return steps
+
+
+def _allowed_steps(tool: str, arguments: dict, claims: dict, index: int, constraints: dict) -> list[dict]:
+    name = f"{SERVER}.{tool}"
+    steps = _rule_steps(tool, arguments)
+    if steps and steps[-1]["kind"] == "fail":
+        return steps
     for key, raw in arguments.items():
         if key in constraints or key == "limit" or (tool == "search" and key == "query"):
             continue
@@ -676,17 +725,7 @@ def _allowed_steps(tool: str, arguments: dict, claims: dict, index: int, constra
     steps.append(
         _step(f"entry {index}", tool, constraints or "no constraints", "allows the call, so it is forwarded", "pass")
     )
-    expected = expected_labels(tool, arguments)
-    clearance = claims.get("clearance")
-    source = ", ".join(expected["decided_by"]) or "no labelled data"
-    value = f"level {expected['level']} from {source}"
-    if isinstance(clearance, int) and expected["level"] > clearance:
-        steps.append(
-            _step("labels", value, f"clearance {clearance}", "CLEARANCE_TOO_LOW, the result is dropped", "fail")
-        )
-    else:
-        steps.append(_step("labels", value, f"clearance {clearance}", "within clearance, ALLOW", "allow"))
-    return steps
+    return steps + _label_steps(tool, arguments, claims)
 
 
 def _scope_steps(tool: str, arguments: dict, claims: dict) -> list[dict]:
@@ -799,7 +838,9 @@ def _summarize(status: int, payload: dict) -> dict:
     decision = payload.get("decision") or {}
     result = payload.get("result")
     rows = result if isinstance(result, list) else [result] if isinstance(result, dict) and result else []
-    groups = [row["total"] for row in rows if isinstance(row, dict) and type(row.get("total")) is int]
+    counted = [row for row in rows if isinstance(row, dict) and {"total", "count"} <= row.keys()]
+    base = (decision.get("disclosure") or {}).get("rounded_to")
+    numbers = [row[key] for row in counted for key in ("total", "count")]
     return {
         "status": status,
         "got": decision.get("decision"),
@@ -809,13 +850,16 @@ def _summarize(status: int, payload: dict) -> dict:
         "sensitivity": decision.get("sensitivity"),
         "count": None if result is None else len(rows),
         "columns": list(rows[0]) if rows and isinstance(rows[0], dict) else [],
-        "smallest_group": min(groups) if groups else None,
+        "rounded_to": base,
+        "rounded": None if not counted else bool(base) and all(type(n) is int and n % base == 0 for n in numbers),
+        "count_values": sorted({row["count"] for row in counted if type(row["count"]) is int}),
+        "cells": counted if len(counted) <= CELLS_SHOWN else [],
     }
 
 
 def _met(expect: str, shown: dict) -> bool:
     if expect == "ALLOW":
-        return shown["status"] == HTTP_OK and shown["got"] == "ALLOW"
+        return shown["status"] == HTTP_OK and shown["got"] == "ALLOW" and shown.get("rounded") is not False
     return shown["status"] == HTTP_FORBIDDEN and shown["reason"] == expect
 
 
