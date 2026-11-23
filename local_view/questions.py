@@ -1,15 +1,21 @@
-# ruff: noqa: RUF002, E501, C901, PLR0911, PLR0912, PLR0915, PLR0917, PLR2004
+# ruff: noqa: E501
 """Question catalogue for the local board.
 
-Questions 0–5 are the eval cases. Questions 6–16 have no cases: Run sends a
-probe that shows what the gateway decides today, and the row says which
-argument or claim is still unread.
+Questions 0-5 run the eval cases. Questions 6 and 15 are answered on this
+gateway: Run sends probes that each expect one decision. The other questions
+are open: Run shows what the gateway decides today, and the row says what is
+still unread.
+
+Every mandate the board runs under is issued from gateway/state and renewed
+when it expires or predates the clearance claim. The board's own mandates
+live in gateway/state/board/, which git ignores with the rest of the state.
 """
 
 from __future__ import annotations
 
 import json
 import posixpath
+import threading
 import time
 from fnmatch import fnmatch
 from pathlib import Path
@@ -17,14 +23,69 @@ from pathlib import Path
 from gateway import eval as ev
 from gateway.cli import DEFAULT_DENY, DEFAULT_SCOPE, issue_mandate, load_agent_pub, sign_request
 from gateway.lib.common import b64u_decode, priv_from_pem
+from gateway.lib.gateway_verify import result_levels, sensitivity_maps, sensitivity_record
+from gateway.main import _CLASSIFICATION_CANDIDATES
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE = ROOT / "gateway" / "state"
+BOARD = STATE / "board"
 PACK = ROOT / "eval_pack"
 SERVER = "pupil-data"
-PUPIL = "P0004"
-SCHOOL = "SCH01"
-CENSUS = "personal_data_school_census"
+PUPIL, SCHOOL, CENSUS = ev.PUPIL, ev.SCHOOL, ev.CENSUS
+CASTLETON, CASTLETON_PUPIL = "SCH03", "P1008"
+TTL = 3 * 86400
+FRESH = 60  # a mandate with less left than this is renewed before a run
+HTTP_OK, HTTP_FORBIDDEN = 200, 403
+STEP_UP = ("*.write", "*.draft")  # the Gateway default in gateway_verify.py
+LIVE = "live"
+_ISSUE = threading.Lock()  # issuing rewrites status_list.json, so one issue at a time
+
+_CASTLETON_SCOPE = [{"server": SERVER, "tools": ["pupil", "roster"], "constraints": {"urn": [CASTLETON]}}]
+_CASTLETON_PURPOSE = "Pupil records for Castleton School"
+MANDATES: dict[str, dict] = {
+    "castleton-4": {
+        "scope": _CASTLETON_SCOPE,
+        "clearance": 4,
+        "purpose": _CASTLETON_PURPOSE,
+        "label": "Castleton, clearance 4",
+    },
+    "castleton-2": {
+        "scope": _CASTLETON_SCOPE,
+        "clearance": 2,
+        "purpose": _CASTLETON_PURPOSE,
+        "label": "Castleton, clearance 2",
+    },
+    "castleton-none": {
+        "scope": _CASTLETON_SCOPE,
+        "clearance": None,
+        "purpose": _CASTLETON_PURPOSE,
+        "label": "Castleton, no clearance",
+    },
+    "newsletter-1": {
+        "scope": [
+            {"server": SERVER, "tools": ["get"], "constraints": {"path": [ev.SCHOOLS]}},
+            {"server": SERVER, "tools": ["search"], "constraints": {"urn": [SCHOOL]}},
+        ],
+        "clearance": 1,
+        "purpose": "The Ashfield school newsletter",
+        "label": "Newsletter, clearance 1",
+    },
+    "counts-3": {
+        "scope": [{"server": SERVER, "tools": ["aggregate"], "constraints": {"table": [CENSUS]}}],
+        "clearance": 3,
+        "purpose": "School-level counts for the local authority",
+        "label": "Counts, clearance 3",
+    },
+}
+_PACK_FIXTURES = {
+    "expired mandate": ("expired", "Expired Ashfield"),
+    "revoked mandate": ("revoked", "Revoked Ashfield"),
+}
+_PACK_JOBS = [
+    ("counts mandate", "counts", "Counts"),
+    ("two-school mandate", "two_schools", "Two schools"),
+    ("Brookmere mandate", "brookmere", "Brookmere"),
+]
 
 # n, state, asks, binds, missing, solves
 _META: list[tuple[int, str, str, str, str, str]] = [
@@ -32,8 +93,8 @@ _META: list[tuple[int, str, str, str, str, str]] = [
         0,
         "solved",
         "Find this pupil's census record at Ashfield.",
-        "Signature, expiry, revocation, then the scope. A non-empty query at the granted school is allowed. The eval also allows the Brookmere mandate at Brookmere and the counts mandate's school totals.",
-        "Nothing this question asks for. The full census row, including ethnicity and care, is still returned. That is question 6.",
+        "Signature, expiry, revocation, clearance, then the scope. A non-empty query at the granted school is allowed. The eval also allows the Brookmere mandate at Brookmere and the counts mandate's school totals.",
+        "Nothing this question asks for. The eval mandates carry clearance 4, so the full census row, ethnicity and care included, still comes back. Question 6 is what refuses it to a lower clearance.",
         "Keep these twelve cases on ALLOW.",
     ),
     (
@@ -78,11 +139,11 @@ _META: list[tuple[int, str, str, str, str, str]] = [
     ),
     (
         6,
-        "open",
+        "answered",
         "Send me the full records for Castleton's pupils, ethnicity and care status included.",
-        "The school and the tool are checked. Labels are read from the manifest on each call. With no clearance the search is still allowed, and the response says so. Ethnicity at 4 outranks URN at 1.",
-        "No clearance claim, and no consent. The response names that, the deciding level, and every label the call touched.",
-        "A clearance of 4 allows the row. A clearance of 1 is CLEARANCE_TOO_LOW because level 4 decides.",
+        "The clearance claim is checked before the scope. Without one the call is CLEARANCE_MISSING, and the decision carries a notice naming the authenticated agent. After the data server answers, every key of the result is looked up in the manifest, which is re-read on each call. The most restrictive label decides, so Ethnicity at 4 outranks URN at 1. Above the clearance the result is dropped with CLEARANCE_TOO_LOW.",
+        "Unresolved: the clearance is whatever the issuer signed, and nothing records consent from the pupil or a parent. The notice goes back in the response. Nothing delivers it to the person yet.",
+        "Castleton at clearance 4 gets the full record. Under clearance 2 the same request is refused because Ethnicity and InCareAtCurrentSchool are level 4, and the Year 11 names at level 2 still pass. With no clearance the call is refused, and the notice says which agent asked.",
     ),
     (
         7,
@@ -96,8 +157,8 @@ _META: list[tuple[int, str, str, str, str, str]] = [
         8,
         "open",
         "How many pupils in care does each school have, split by ethnic group?",
-        "The counts mandate checks table and measure only. group_by and where are not constraints, and the counts in the result are not looked at.",
-        "group_by, where, and a minimum cell size. A group of one is a pupil, and the gateway cannot see that.",
+        "The counts mandate checks table and measure only. group_by and where are not constraints. The eval counts mandate has clearance 4, so a group by Ethnicity passes the label check too.",
+        "A minimum cell size. A group of one is a pupil, and neither the scope nor the labels can see that. Under clearance 3 the Ethnicity key at level 4 would refuse it, but that is the label, not a cell rule.",
         "Refuse a risky group_by, or suppress a cell under the floor, before the count is returned.",
     ),
     (
@@ -105,7 +166,7 @@ _META: list[tuple[int, str, str, str, str, str]] = [
         "open",
         "Just correct the record yourself.",
         "The default deny lists *.write, so write is DENIED_BY_RULE and never reaches STEP_UP. A mandate with an empty deny would get 202, and nothing can release it.",
-        "No approver and no one-shot approval id. The hold has no second call that lets it through once.",
+        "No approver and no one-shot approval id. The clearance is checked on the result, so a write that got through would land before its labels were read.",
         "Allow write only with an approval id the gateway accepts once, and leave an unanswered hold at 202.",
     ),
     (
@@ -150,11 +211,11 @@ _META: list[tuple[int, str, str, str, str, str]] = [
     ),
     (
         15,
-        "open",
+        "answered",
         "This one's only doing the newsletter. It doesn't need anything personal.",
-        "Same as question 6: an allowed search returns the level-4 columns. The deny entry pii.* matches no tool name.",
-        "No clearance claim. pii.* is not a parameter of any tool, so it never fires.",
-        "Enforce a clearance of 1 by stripping or refusing personal columns. Do not treat pii.* as that control.",
+        "The same check as question 6, at two clearances. The newsletter mandate is clearance 1: the schools list at level 1 passes, and census rows at level 4 are refused. The counts mandate is clearance 3: free school meal counts at level 3 pass, and care counts at level 4 are refused.",
+        "The gateway refuses the whole result rather than stripping columns, so asking for fewer columns gets round nothing, and a refused row cannot be had in part. A column decides for row results. For get, the table's label decides. pii.* is still in the default deny and still matches no tool.",
+        "A newsletter mandate at 1 and a counts mandate at 3, each with one request allowed and one refused. A label changed in the manifest applies to the next call.",
     ),
     (
         16,
@@ -166,19 +227,162 @@ _META: list[tuple[int, str, str, str, str, str]] = [
     ),
 ]
 
-
-_MANIFEST = ROOT / "mcp_server" / "data" / "synthetic" / "synthetic_manifest.json"
-_FILE_TABLE = {
-    "synthetic/synthetic_schools.csv": "schools",
-    "synthetic/synthetic_display_names.csv": "display_names",
-    "synthetic/synthetic_personal_data_school_census.csv": "personal_data_school_census",
-    "synthetic/synthetic_personal_data_deprivation.csv": "personal_data_deprivation",
+_RECORD = {"pupil_id": CASTLETON_PUPIL, "urn": CASTLETON}
+_ANSWERED: dict[int, list[dict]] = {
+    6: [
+        {
+            "mandate": "castleton-4",
+            "name": "full record under clearance 4",
+            "tool": "pupil",
+            "arguments": _RECORD,
+            "expect": "ALLOW",
+        },
+        {
+            "mandate": "castleton-2",
+            "name": "the same record under clearance 2",
+            "tool": "pupil",
+            "arguments": _RECORD,
+            "expect": "CLEARANCE_TOO_LOW",
+        },
+        {
+            "mandate": "castleton-2",
+            "name": "Year 11 names under clearance 2",
+            "tool": "roster",
+            "arguments": {"urn": CASTLETON, "year_group": 11},
+            "expect": "ALLOW",
+        },
+        {
+            "mandate": "castleton-none",
+            "name": "the same record with no clearance",
+            "tool": "pupil",
+            "arguments": _RECORD,
+            "expect": "CLEARANCE_MISSING",
+        },
+    ],
+    15: [
+        {
+            "mandate": "newsletter-1",
+            "name": "newsletter: the schools list",
+            "tool": "get",
+            "arguments": {"path": ev.SCHOOLS},
+            "expect": "ALLOW",
+        },
+        {
+            "mandate": "newsletter-1",
+            "name": "newsletter: census rows",
+            "tool": "search",
+            "arguments": {"query": "SPR", "urn": SCHOOL},
+            "expect": "CLEARANCE_TOO_LOW",
+        },
+        {
+            "mandate": "counts-3",
+            "name": "counts: free school meals by school",
+            "tool": "aggregate",
+            "arguments": {"table": CENSUS, "group_by": ["URN"], "measure": "FSMeligible"},
+            "expect": "ALLOW",
+        },
+        {
+            "mandate": "counts-3",
+            "name": "counts: pupils in care by school",
+            "tool": "aggregate",
+            "arguments": {"table": CENSUS, "group_by": ["URN"], "measure": "InCareAtCurrentSchool"},
+            "expect": "CLEARANCE_TOO_LOW",
+        },
+    ],
 }
-_STEP_UP = ("*.write", "*.draft")
+_OPEN: dict[int, list[dict]] = {
+    7: [
+        {
+            "mandate": LIVE,
+            "name": "a helper holding the whole mandate",
+            "tool": "search",
+            "arguments": {"query": "SPR", "urn": SCHOOL, "limit": 5},
+            "today": "ALLOW, with full census rows. Nothing on the token is a narrower grant for a helper.",
+        }
+    ],
+    8: [
+        {
+            "mandate": "counts",
+            "name": "counts grouped by school and ethnicity",
+            "tool": "aggregate",
+            "arguments": {"table": CENSUS, "group_by": ["URN", "Ethnicity"], "measure": "FSMeligible"},
+            "today": "ALLOW. group_by is not a constraint, small cells are returned, and clearance 4 covers Ethnicity.",
+        }
+    ],
+    9: [
+        {
+            "mandate": LIVE,
+            "name": "write under the default deny",
+            "tool": "write",
+            "arguments": {"path": ev.SCHOOLS},
+            "today": "DENIED_BY_RULE. STEP_UP is never reached, and nothing could release a hold.",
+        }
+    ],
+    10: [
+        {
+            "mandate": LIVE,
+            "name": "a scoped search the sentence never mentioned",
+            "tool": "search",
+            "arguments": {"query": PUPIL, "urn": SCHOOL},
+            "today": "ALLOW, because the JSON scope says so. The sentence is not an input.",
+        }
+    ],
+    11: [
+        {
+            "mandate": LIVE,
+            "name": "first pupil search",
+            "tool": "search",
+            "arguments": {"query": PUPIL, "urn": SCHOOL, "limit": 1},
+            "today": "ALLOW.",
+        },
+        {
+            "mandate": LIVE,
+            "name": "second pupil search, same mandate",
+            "tool": "search",
+            "arguments": {"query": "P1033", "urn": SCHOOL, "limit": 1},
+            "today": "ALLOW again. No budget was used up by the first call.",
+        },
+    ],
+    12: [
+        {
+            "mandate": LIVE,
+            "name": "a letters-purpose search returns care status",
+            "tool": "search",
+            "arguments": {"query": PUPIL, "urn": SCHOOL},
+            "today": "ALLOW, with InCareAtCurrentSchool in the row. purpose is on the token and is not read.",
+        }
+    ],
+    13: [
+        {
+            "mandate": LIVE,
+            "name": "call after the named person would have left",
+            "tool": "search",
+            "arguments": {"query": PUPIL, "urn": SCHOOL},
+            "today": "ALLOW. The principal is a label, and there is no later change to read.",
+        }
+    ],
+    14: [
+        {
+            "mandate": LIVE,
+            "name": "one allowed call, then look for a record",
+            "tool": "search",
+            "arguments": {"query": PUPIL, "urn": SCHOOL, "limit": 1},
+            "today": "ALLOW, and gateway/state has no audit file of what was returned.",
+        }
+    ],
+    16: [
+        {
+            "mandate": LIVE,
+            "name": "a call that should have been logged",
+            "tool": "search",
+            "arguments": {"query": PUPIL, "urn": SCHOOL, "limit": 1},
+            "today": "ALLOW, and nothing was appended for the person to read later.",
+        }
+    ],
+}
 
 
-def _classification() -> dict:
-    return json.loads(_MANIFEST.read_text())["classification"]
+# ---------------------------------------------------------------- mandates
 
 
 def _read_jwt(path: Path) -> dict:
@@ -187,480 +391,481 @@ def _read_jwt(path: Path) -> dict:
     return json.loads(b64u_decode(path.read_text().strip().split(".")[1]))
 
 
-def _mandate_file(case: dict) -> tuple[Path, str]:
-    name = case.get("name", "")
+def _rel(path: Path) -> str:
+    return str(path.relative_to(ROOT)) if path.is_relative_to(ROOT) else str(path)
+
+
+def _lasts(claims: dict) -> bool:
+    return claims.get("exp", 0) > time.time() + FRESH
+
+
+def ensure_pack() -> None:
+    """eval_pack as make eval_build writes it, rebuilt when it expires or predates the clearance claim."""
+    with _ISSUE:
+        claims = _read_jwt(PACK / "valid.jwt")
+        if _lasts(claims) and claims.get("clearance") is not None:
+            return
+        ev.main(["build", "--state", str(STATE), "-o", str(PACK)])
+
+
+def ensure_local_mandate() -> None:
+    """mandate.jwt as make gateway_issue writes it, renewed when it expires or has no clearance."""
+    path = STATE / "mandate.jwt"
+    with _ISSUE:
+        claims = _read_jwt(path)
+        if _lasts(claims) and claims.get("clearance") is not None:
+            return
+        token, _idx = issue_mandate(
+            STATE,
+            load_agent_pub(STATE / "agent.pem"),
+            scope=DEFAULT_SCOPE,
+            deny=DEFAULT_DENY,
+            ttl=TTL,
+            purpose="Pupil-data lookups for school SCH01",
+            principal="officer:jsmith",
+            org="school:SCH01",
+            extra={"clearance": 4},
+        )
+        path.write_text(token)
+
+
+def ensure_board_mandate(stem: str) -> None:
+    spec = MANDATES[stem]
+    path = BOARD / f"{stem}.jwt"
+    with _ISSUE:
+        claims = _read_jwt(path)
+        if _lasts(claims) and all(claims.get(key) == spec[key] for key in ("scope", "clearance", "purpose")):
+            return
+        BOARD.mkdir(exist_ok=True)
+        token, _idx = issue_mandate(
+            STATE,
+            load_agent_pub(STATE / "agent.pem"),
+            scope=spec["scope"],
+            deny=DEFAULT_DENY,
+            ttl=TTL,
+            purpose=spec["purpose"],
+            principal="officer:jsmith",
+            org="board:local",
+            extra={} if spec["clearance"] is None else {"clearance": spec["clearance"]},
+        )
+        path.write_text(token)
+
+
+def prepare() -> str | None:
+    """Make every mandate the board runs under usable. Returns what is missing, if anything."""
+    if not (STATE / "issuer_key.pem").is_file() or not (STATE / "agent.pem").is_file():
+        return "gateway/state has no issuer or team key: run make gateway_init"
+    ensure_pack()
+    ensure_local_mandate()
+    for stem in MANDATES:
+        ensure_board_mandate(stem)
+    return None
+
+
+def _mandate_for(case: dict) -> tuple[Path, Path, str]:
+    """(agent key, mandate file, label) for one case."""
     which = case.get("mandate")
-    if which == "counts" or name.startswith("counts mandate"):
-        return PACK / "counts.jwt", "Counts"
-    if name.startswith("two-school mandate"):
-        return PACK / "two_schools.jwt", "Two schools"
-    if name.startswith("Brookmere mandate"):
-        return PACK / "brookmere.jwt", "Brookmere"
-    if name == "expired mandate":
-        return PACK / "expired.jwt", "Expired Ashfield"
-    if name == "revoked mandate":
-        return PACK / "revoked.jwt", "Revoked Ashfield"
-    if which == "live" or (which is None and not name):
-        return STATE / "mandate.jwt", "Local Ashfield"
-    if which == "live":
-        return STATE / "mandate.jwt", "Local Ashfield"
-    return PACK / "valid.jwt", "Ashfield"
+    if which in MANDATES:
+        return STATE / "agent.pem", BOARD / f"{which}.jwt", MANDATES[which]["label"]
+    if which == LIVE:
+        return STATE / "agent.pem", STATE / "mandate.jwt", "Local Ashfield"
+    if which == "counts":
+        return PACK / "agent.pem", PACK / "counts.jwt", "Counts"
+    name = case.get("name", "")
+    if name in _PACK_FIXTURES:
+        stem, label = _PACK_FIXTURES[name]
+        return PACK / "agent.pem", PACK / f"{stem}.jwt", label
+    for prefix, stem, label in _PACK_JOBS:
+        if name.startswith(prefix):
+            return PACK / "agent.pem", PACK / f"{stem}.jwt", label
+    return PACK / "agent.pem", PACK / "valid.jwt", "Ashfield"
 
 
-def _flag(table: str | None, column: str, clf: dict) -> dict:
-    level = (clf.get("columns") or {}).get(table or "", {}).get(column)
-    label = (clf.get("levels") or {}).get(str(level), "")
-    return {"name": column, "level": level, "label": label}
+def mandates() -> list[dict]:
+    """Every mandate the board can run under, as the claims the gateway will read."""
+    prepare()
+    files = [("Local Ashfield", STATE / "mandate.jwt")]
+    files += [(spec["label"], BOARD / f"{stem}.jwt") for stem, spec in MANDATES.items()]
+    files += [("Eval: Ashfield", PACK / "valid.jwt")]
+    files += [(f"Eval: {label}", PACK / f"{stem}.jwt") for _prefix, stem, label in _PACK_JOBS]
+    files += [(f"Eval: {label}", PACK / f"{stem}.jwt") for stem, label in _PACK_FIXTURES.values()]
+    rows = []
+    for label, path in files:
+        claims = _read_jwt(path)
+        rows.append(
+            {
+                "label": label,
+                "file": _rel(path),
+                "clearance": claims.get("clearance"),
+                "scope": claims.get("scope") or [],
+                "deny": claims.get("deny") or [],
+                "exp": claims.get("exp"),
+                "idx": ((claims.get("status") or {}).get("status_list") or {}).get("idx"),
+                "purpose": claims.get("purpose"),
+            }
+        )
+    return rows
 
 
-def touches(tool: str, arguments: dict) -> dict:
-    """Which labelled table and columns this call reads. The gateway does not look at these."""
-    clf = _classification()
-    table = None
-    used: list[str] = []
-    if tool == "search":
-        table = "personal_data_school_census"
-        used = list((clf.get("columns") or {}).get(table, {}))
-    elif tool == "aggregate":
-        table = str(arguments.get("table") or "")
-        used = [*(arguments.get("group_by") or []), arguments.get("measure")]
-    elif tool in {"get", "write"}:
-        norm = posixpath.normpath(str(arguments.get("path", "")))
-        table = _FILE_TABLE.get(norm)
-        used = list((clf.get("columns") or {}).get(table or "", {}))
-    columns = [_flag(table, name, clf) for name in used if name]
-    level = (clf.get("tables") or {}).get(table or "")
-    return {
-        "table": table,
-        "table_level": level,
-        "table_label": (clf.get("levels") or {}).get(str(level), ""),
-        "columns": columns,
+# ---------------------------------------------------------------- labels
+
+
+def label_file() -> Path | None:
+    """The first manifest the gateway would read, in the order gateway/main.py tries them."""
+    for raw in _CLASSIFICATION_CANDIDATES:
+        if not raw:
+            continue
+        path = Path(raw) if Path(raw).is_absolute() else ROOT / raw
+        if path.is_file():
+            return path
+    return None
+
+
+def _classification() -> dict:
+    path = label_file()
+    return json.loads(path.read_text())["classification"] if path else {"levels": {}, "tables": {}, "columns": {}}
+
+
+def labels_in_force() -> dict:
+    path = label_file()
+    if path is None:
+        return {"error": f"no manifest under {_CLASSIFICATION_CANDIDATES}"}
+    return {"path": _rel(path), **_classification()}
+
+
+def _result_shape(tool: str, arguments: dict, columns: dict) -> object:
+    """A result with the keys the tool returns, so the gateway's own rules can label it before the call."""
+    census = dict.fromkeys(columns.get(CENSUS, {}))
+    group_by = arguments.get("group_by")
+    shapes = {
+        "search": [census],
+        "pupil": {**census, "DisplayName": None, **dict.fromkeys(columns.get("personal_data_deprivation", {}))},
+        "roster": [{"Psuedo ID": None, "DisplayName": None}],
+        "draft": [{"Psuedo ID": None, "letter": None}],
+        "aggregate": [{**dict.fromkeys(group_by if isinstance(group_by, list) else []), "total": 0, "count": 0}],
+        "write": dict.fromkeys(("ts", "pupil_id", "urn", "column", "before", "after", "reason")),
+        "classification": dict.fromkeys(("levels", "tables", "columns")),
+        "get": [],
     }
+    return shapes.get(tool)
+
+
+def expected_labels(tool: str, arguments: dict) -> dict:
+    clf = _classification()
+    columns, tables = sensitivity_maps(clf)
+    names = {int(level): name for level, name in clf["levels"].items()}
+    shaped = _result_shape(tool, arguments, clf["columns"])
+    levels = result_levels(tool, arguments, shaped, columns, tables, max(names, default=4))
+    return sensitivity_record(levels, names, None)
+
+
+# ---------------------------------------------------------------- how a call is matched
+
+
+def _step(check: str, value: object, against: object, result: str, kind: str) -> dict:
+    """kind: pass, fail, hold, allow, or unread. fail, hold, and allow are the step that decides."""
+    return {"check": check, "value": value, "against": against, "result": result, "kind": kind}
+
+
+def _verify_steps(label: str, claims: dict) -> list[dict]:
+    if label == "Expired Ashfield":
+        return [
+            _step(
+                "exp",
+                "the time of the call",
+                "this fixture's exp, already past",
+                "EXPIRED before any argument is compared",
+                "fail",
+            )
+        ]
+    if label == "Revoked Ashfield":
+        return [
+            _step(
+                "status bit",
+                "this fixture's index",
+                "the bit in status_list.jwt",
+                "REVOKED before any argument is compared",
+                "fail",
+            )
+        ]
+    clearance = claims.get("clearance")
+    if clearance is None:
+        return [
+            _step(
+                "clearance",
+                "absent",
+                "a level 1-4 on the mandate",
+                "CLEARANCE_MISSING, with a notice naming the agent",
+                "fail",
+            )
+        ]
+    return [_step("clearance", clearance, "a level 1-4 on the mandate", "present", "pass")]
+
+
+def _constraint_steps(constraints: dict, arguments: dict, steps: list[dict]) -> str | None:
+    for key, allowed in constraints.items():
+        if key not in arguments:
+            steps.append(_step(key, "absent", allowed, "CONSTRAINT_MISSING", "fail"))
+            return "CONSTRAINT_MISSING"
+        raw = arguments[key]
+        listed = [str(item) for item in allowed]
+        if key == "path":
+            got = posixpath.normpath(str(raw))
+            listed = [posixpath.normpath(item) for item in listed]
+            raw = raw if got == raw else f"{raw} -> {got}"
+            ok = got in listed
+        else:
+            ok = str(raw) in listed
+        steps.append(_step(key, raw, listed, "equal" if ok else "CONSTRAINT_VIOLATED", "pass" if ok else "fail"))
+        if not ok:
+            return "CONSTRAINT_VIOLATED"
+    return None
+
+
+def _allowed_steps(tool: str, arguments: dict, claims: dict, index: int, constraints: dict) -> list[dict]:
+    name = f"{SERVER}.{tool}"
+    steps = []
+    for key, raw in arguments.items():
+        if key in constraints:
+            continue
+        if tool == "search" and key == "query":
+            empty = not str(raw).strip()
+            steps.append(
+                _step(
+                    "query",
+                    raw,
+                    "not empty (a gateway rule)",
+                    "CONSTRAINT_VIOLATED" if empty else "not empty",
+                    "fail" if empty else "pass",
+                )
+            )
+            if empty:
+                return steps
+            continue
+        steps.append(_step(key, raw, "not on this entry", "not compared", "unread"))
+    held = next((pat for pat in STEP_UP if fnmatch(name, pat)), None)
+    if held:
+        steps.append(_step("step-up", name, held, "STEP_UP 202, held for a person, and nothing releases it", "hold"))
+        return steps
+    steps.append(
+        _step(f"entry {index}", tool, constraints or "no constraints", "allows the call, so it is forwarded", "pass")
+    )
+    expected = expected_labels(tool, arguments)
+    clearance = claims.get("clearance")
+    source = ", ".join(expected["decided_by"]) or "no labelled data"
+    value = f"level {expected['level']} from {source}"
+    if isinstance(clearance, int) and expected["level"] > clearance:
+        steps.append(
+            _step("labels", value, f"clearance {clearance}", "CLEARANCE_TOO_LOW, the result is dropped", "fail")
+        )
+    else:
+        steps.append(_step("labels", value, f"clearance {clearance}", "within clearance, ALLOW", "allow"))
+    return steps
+
+
+def _scope_steps(tool: str, arguments: dict, claims: dict) -> list[dict]:
+    name = f"{SERVER}.{tool}"
+    deny = claims.get("deny") or []
+    hit = next((pat for pat in deny if fnmatch(name, pat)), None)
+    steps = [
+        _step(
+            "deny",
+            name,
+            deny,
+            f"DENIED_BY_RULE, matches {hit}" if hit else "no pattern matches",
+            "fail" if hit else "pass",
+        )
+    ]
+    if hit:
+        return steps
+    scope = claims.get("scope") or []
+    failure = None
+    for index, entry in enumerate(scope):
+        tools = entry.get("tools") or []
+        if entry.get("server") != SERVER or tool not in tools:
+            steps.append(_step(f"entry {index}", tool, tools, "does not list the tool", "pass"))
+            continue
+        constraints = entry.get("constraints") or {}
+        code = _constraint_steps(constraints, arguments, steps)
+        if code is None:
+            return steps + _allowed_steps(tool, arguments, claims, index, constraints)
+        if failure != "CONSTRAINT_VIOLATED":
+            failure = code
+    steps.append(
+        _step(
+            "scope",
+            tool,
+            [entry.get("tools") for entry in scope],
+            failure or "OUT_OF_SCOPE, no entry lists the tool",
+            "fail",
+        )
+    )
+    return steps
 
 
 def explain_match(tool: str, arguments: dict, claims: dict, label: str) -> dict:
-    """Plain steps of check_request: each argument beside the mandate value it is compared to."""
-    scope = claims.get("scope") or []
-    deny = claims.get("deny") or []
+    """The gateway's checks in its own order, each argument beside the mandate value it is compared with."""
+    steps = _verify_steps(label, claims)
+    if steps[-1]["kind"] == "pass":
+        steps += _scope_steps(tool, arguments, claims)
     principal = (claims.get("delegator") or {}).get("principal")
-    name = f"pupil-data.{tool}"
-    steps: list[dict] = []
-    if label == "Expired Ashfield":
-        steps.append({
-            "check": "exp",
-            "value": "the call's time",
-            "against": "this fixture's exp is already past",
-            "result": "EXPIRED, before any argument is compared",
-            "decides": True,
-        })
-    elif label == "Revoked Ashfield":
-        steps.append({
-            "check": "status bit",
-            "value": "this fixture's index",
-            "against": "the bit on status_list.jwt",
-            "result": "REVOKED, before any argument is compared",
-            "decides": True,
-        })
-    hit = next((pat for pat in deny if fnmatch(name, pat)), None)
-    steps.append({
-        "check": "deny",
-        "value": name,
-        "against": deny,
-        "result": f"matches {hit}" if hit else "no pattern matches",
-        "decides": hit is not None,
-    })
-    if hit or label in {"Expired Ashfield", "Revoked Ashfield"}:
-        return _match_tail(label, claims, principal, scope, deny, steps, decided=True)
-    decided = False
-    for index, entry in enumerate(scope):
-        tools = entry.get("tools") or []
-        if entry.get("server") != "pupil-data" or tool not in tools:
-            steps.append({
-                "check": f"entry {index} tools",
-                "value": tool,
-                "against": tools,
-                "result": "this entry does not list the tool",
-                "decides": False,
-            })
-            continue
-        constraints = entry.get("constraints") or {}
-        failed = False
-        for key, allowed in constraints.items():
-            if key not in arguments:
-                steps.append({
-                    "check": key,
-                    "value": "absent",
-                    "against": allowed,
-                    "result": "argument missing",
-                    "decides": True,
-                })
-                failed = True
-                break
-            raw = arguments[key]
-            if key == "path":
-                got = posixpath.normpath(str(raw))
-                allowed_n = [posixpath.normpath(str(item)) for item in allowed]
-                ok = got in allowed_n
-                steps.append({
-                    "check": "path",
-                    "value": f"{raw} → {got}",
-                    "against": allowed_n,
-                    "result": "equal" if ok else "not in the list",
-                    "decides": not ok,
-                })
-            else:
-                ok = str(raw) in {str(item) for item in allowed}
-                steps.append({
-                    "check": key,
-                    "value": raw,
-                    "against": list(allowed),
-                    "result": "equal" if ok else "not in the list",
-                    "decides": not ok,
-                })
-            if not ok:
-                failed = True
-                break
-        if failed:
-            continue
-        for key, raw in arguments.items():
-            if key in constraints:
-                continue
-            if tool == "search" and key == "query" and not str(raw).strip():
-                steps.append({
-                    "check": "query",
-                    "value": raw,
-                    "against": "must be non-empty (not a list on the mandate)",
-                    "result": "empty query is refused",
-                    "decides": True,
-                })
-                return _match_tail(label, claims, principal, scope, deny, steps, decided=True)
-            steps.append({
-                "check": key,
-                "value": raw,
-                "against": "not on this entry",
-                "result": "not compared",
-                "decides": False,
-            })
-        held = next((pat for pat in _STEP_UP if fnmatch(name, pat)), None)
-        if held:
-            steps.append({
-                "check": "step-up",
-                "value": name,
-                "against": held,
-                "result": "held for a person; nothing releases it",
-                "decides": True,
-            })
-        else:
-            steps.append({
-                "check": f"entry {index}",
-                "value": tool,
-                "against": constraints,
-                "result": "this entry allows the call",
-                "decides": True,
-            })
-        decided = True
-        break
-    if not decided:
-        steps.append({
-            "check": "scope",
-            "value": tool,
-            "against": [entry.get("tools") for entry in scope],
-            "result": "no entry allows it",
-            "decides": True,
-        })
-    return _match_tail(label, claims, principal, scope, deny, steps, decided=True)
+    steps += [
+        _step("purpose", "not an argument", claims.get("purpose"), "signed, not read", "unread"),
+        _step("principal", "not an argument", principal, "signed, not read", "unread"),
+    ]
+    return {"label": label, "clearance": claims.get("clearance"), "steps": steps}
 
 
-def _match_tail(label: str, claims: dict, principal: object, scope: list, deny: list, steps: list, *, decided: bool) -> dict:
-    del decided
-    steps.append({
-        "check": "purpose",
-        "value": "not an argument",
-        "against": claims.get("purpose"),
-        "result": "signed, not read",
-        "decides": False,
-    })
-    steps.append({
-        "check": "principal",
-        "value": "not an argument",
-        "against": principal,
-        "result": "signed, not read",
-        "decides": False,
-    })
-    return {"label": label, "deny": deny, "scope": scope, "steps": steps}
-
-
-def _annotate(case: dict) -> dict:
-    path, label = _mandate_file(case)
-    claims = _read_jwt(path)
-    return {
-        **case,
-        "match": explain_match(case["tool"], case["arguments"], claims, label),
-        "sensitivity": touches(case["tool"], case["arguments"]),
-    }
+# ---------------------------------------------------------------- catalogue and runs
 
 
 def _eval_cases(n: int) -> list[dict]:
     rows: list[dict] = []
     if n == 0:
-        for name, tool, args in ev.VALID:
-            rows.append({"name": name, "tool": tool, "arguments": args, "expect": "ALLOW"})
-    for question, name, tool, args, code in ev.INVALID:
-        if question == n:
-            rows.append({"name": name, "tool": tool, "arguments": args, "expect": code})
-    for question, name, tool, args, expect in ev.BUILD:
-        if question == n:
-            rows.append({"name": name, "tool": tool, "arguments": args, "expect": expect})
+        rows += [{"name": name, "tool": tool, "arguments": args, "expect": "ALLOW"} for name, tool, args in ev.VALID]
+    rows += [
+        {"name": name, "tool": tool, "arguments": args, "expect": code}
+        for q, name, tool, args, code in ev.INVALID
+        if q == n
+    ]
+    rows += [
+        {"name": name, "tool": tool, "arguments": args, "expect": exp}
+        for q, name, tool, args, exp in ev.BUILD
+        if q == n
+    ]
     return rows
 
 
-def _open_cases(n: int) -> list[dict]:
-    live = {"mandate": "live"}
-    if n == 6:
-        return [{
-            **live,
-            "name": "in-scope search returns the census row",
-            "tool": "search",
-            "arguments": {"query": PUPIL, "urn": SCHOOL},
-            "today": "ALLOW. The decision says there is no clearance, and level 4 decides over level 1.",
-        }]
-    if n == 7:
-        return [{
-            **live,
-            "name": "the only grant is the whole mandate",
-            "tool": "search",
-            "arguments": {"query": "Y11", "urn": SCHOOL},
-            "today": "ALLOW. Nothing on the token is a narrower grant for a helper.",
-        }]
-    if n == 8:
-        return [{
-            "mandate": "counts",
-            "name": "counts grouped by school and ethnicity",
-            "tool": "aggregate",
-            "arguments": {
-                "table": CENSUS,
-                "group_by": ["URN", "Ethnicity"],
-                "measure": "FSMeligible",
-            },
-            "today": "ALLOW. group_by is not a constraint, and small cells are returned.",
-        }]
-    if n == 9:
-        return [{
-            **live,
-            "name": "write under the default deny",
-            "tool": "write",
-            "arguments": {"path": "synthetic/synthetic_schools.csv"},
-            "today": "DENIED_BY_RULE. STEP_UP is never reached, and nothing could release a hold.",
-        }]
-    if n == 10:
-        return [{
-            **live,
-            "name": "a scoped search the sentence never mentioned",
-            "tool": "search",
-            "arguments": {"query": PUPIL, "urn": SCHOOL},
-            "today": "ALLOW, because the JSON scope says so. The sentence is not an input.",
-        }]
-    if n == 11:
-        return [
-            {
-                **live,
-                "name": "first pupil search",
-                "tool": "search",
-                "arguments": {"query": PUPIL, "urn": SCHOOL, "limit": 1},
-                "today": "ALLOW.",
-            },
-            {
-                **live,
-                "name": "second pupil search, same mandate",
-                "tool": "search",
-                "arguments": {"query": "Y11", "urn": SCHOOL, "limit": 1},
-                "today": "ALLOW again. No budget was consumed by the first call.",
-            },
-        ]
-    if n == 12:
-        return [{
-            **live,
-            "name": "care lookup on a letters-shaped purpose",
-            "tool": "search",
-            "arguments": {"query": "InCare", "urn": SCHOOL},
-            "today": "ALLOW. purpose is on the token and is not read.",
-        }]
-    if n == 13:
-        return [{
-            **live,
-            "name": "call after the named person would have left",
-            "tool": "search",
-            "arguments": {"query": PUPIL, "urn": SCHOOL},
-            "today": "ALLOW. The principal is a label, and there is no later change to read.",
-        }]
-    if n == 14:
-        return [{
-            **live,
-            "name": "one allowed call, then look for a record",
-            "tool": "search",
-            "arguments": {"query": PUPIL, "urn": SCHOOL, "limit": 1},
-            "today": "ALLOW, and gateway/state has no audit file of what was returned.",
-        }]
-    if n == 15:
-        return [{
-            **live,
-            "name": "newsletter-wide search",
-            "tool": "search",
-            "arguments": {"query": PUPIL, "urn": SCHOOL},
-            "today": "ALLOW with personal columns. pii.* did not match the tool.",
-        }]
-    if n == 16:
-        return [{
-            **live,
-            "name": "a call that should have been logged",
-            "tool": "search",
-            "arguments": {"query": PUPIL, "urn": SCHOOL, "limit": 1},
-            "today": "ALLOW, and nothing was appended for the person to read later.",
-        }]
-    return []
+def _annotate(case: dict) -> dict:
+    _key, path, label = _mandate_for(case)
+    claims = _read_jwt(path)
+    return {
+        **case,
+        "mandate_label": label,
+        "mandate_file": _rel(path),
+        "match": explain_match(case["tool"], case["arguments"], claims, label),
+        "labels": expected_labels(case["tool"], case["arguments"]),
+    }
 
 
-def _question(n: int) -> dict | None:
-    for item in _META:
-        if item[0] == n:
-            number, state, asks, binds, missing, solves = item
-            cases = _eval_cases(number) if state == "solved" else _open_cases(number)
-            cases = [_annotate(case) for case in cases]
-            return {
-                "n": number,
-                "state": state,
-                "asks": asks,
-                "binds": binds,
-                "missing": missing,
-                "solves": solves,
-                "cases": cases,
-            }
-    return None
+def _question(item: tuple[int, str, str, str, str, str]) -> dict:
+    n, state, asks, binds, missing, solves = item
+    probes = {"answered": _ANSWERED, "open": _OPEN}
+    cases = _eval_cases(n) if state == "solved" else probes[state].get(n, [])
+    return {
+        "n": n,
+        "state": state,
+        "asks": asks,
+        "binds": binds,
+        "missing": missing,
+        "solves": solves,
+        "cases": [_annotate(case) for case in cases],
+    }
 
 
 def catalog() -> list[dict]:
-    return [row for n in range(17) if (row := _question(n)) is not None]
-
-
-def _result_flags(columns: list[str], sensitivity: dict) -> list[dict]:
-    known = {col["name"]: col for col in sensitivity.get("columns") or []}
-    flags = []
-    for name in columns:
-        if name in known:
-            flags.append(known[name])
-            continue
-        flags.append({"name": name, "level": None, "label": "not a source column"})
-    return flags
+    error = prepare()
+    rows = [_question(item) for item in _META]
+    return [{**row, "error": error} for row in rows] if error else rows
 
 
 def _summarize(status: int, payload: dict) -> dict:
     decision = payload.get("decision") or {}
     result = payload.get("result")
-    columns: list[str] = []
-    count = None
-    if isinstance(result, list):
-        count = len(result)
-        if result and isinstance(result[0], dict):
-            columns = list(result[0])
-    elif isinstance(result, dict):
-        columns = list(result)
+    rows = result if isinstance(result, list) else [result] if isinstance(result, dict) and result else []
     return {
         "status": status,
         "got": decision.get("decision"),
         "reason": decision.get("reason_code"),
-        "count": count,
-        "columns": columns,
+        "detail": decision.get("detail") or payload.get("error") or "",
+        "notice": decision.get("notice", ""),
+        "sensitivity": decision.get("sensitivity"),
+        "count": None if result is None else len(rows),
+        "columns": list(rows[0]) if rows and isinstance(rows[0], dict) else [],
     }
 
 
-def _sign(which: str, tool: str, arguments: dict) -> dict:
-    if which == "counts":
-        key = PACK / "agent.pem"
-        mandate = (PACK / "counts.jwt").read_text().strip()
-    else:
-        key = STATE / "agent.pem"
-        mandate = (STATE / "mandate.jwt").read_text().strip()
-    return sign_request(
-        priv_from_pem(key.read_bytes()),
-        server=SERVER,
-        tool=tool,
-        arguments=arguments,
-        mandate=mandate,
-    )
+def _met(expect: str, shown: dict) -> bool:
+    if expect == "ALLOW":
+        return shown["status"] == HTTP_OK and shown["got"] == "ALLOW"
+    return shown["status"] == HTTP_FORBIDDEN and shown["reason"] == expect
 
 
-def _claims() -> dict:
-    token = (STATE / "mandate.jwt").read_text().strip()
-    return json.loads(b64u_decode(token.split(".")[1]))
+def _eval_runs(post) -> dict[int, list[tuple[bool, str, int, dict]]]:
+    """Run the eval once. Each line is paired with the response it came from, by question."""
+    seen: list[tuple[int, dict]] = []
 
-
-def ensure_local_mandate() -> None:
-    """Replace mandate.jwt when it has expired. The cli default lifetime is two hours."""
-    path = STATE / "mandate.jwt"
-    if path.is_file():
-        exp = _claims().get("exp", 0)
-        if exp > time.time() + 60:
-            return
-    token, _idx = issue_mandate(
-        STATE,
-        load_agent_pub(STATE / "agent.pem"),
-        scope=DEFAULT_SCOPE,
-        deny=DEFAULT_DENY,
-        ttl=3 * 86400,
-        purpose="Pupil-data lookups for school SCH01",
-        principal="officer:jsmith",
-        org="school:SCH01",
-    )
-    path.write_text(token)
-
-
-def _run_eval(question: dict, post) -> dict:
     def one(body: dict) -> tuple[int, dict]:
         status, payload = post(body)
-        return status, payload if isinstance(payload, dict) else {}
+        payload = payload if isinstance(payload, dict) else {}
+        seen.append((status, payload))
+        return status, payload
 
-    results = [(ok, line) for ok, line in ev.run_cases(PACK, one) if line.startswith(f"Q{question['n']} ")]
-    if len(results) != len(question["cases"]):
-        return {
-            **question,
-            "error": f"eval returned {len(results)} lines for {len(question['cases'])} cases",
-        }
-    cases = []
-    for case, (ok, line) in zip(question["cases"], results, strict=True):
-        cases.append({**case, "ok": ok, "report": line})
-    passed = sum(1 for case in cases if case.get("ok"))
-    return {**question, "cases": cases, "passed": passed, "total": len(cases)}
+    runs: dict[int, list[tuple[bool, str, int, dict]]] = {}
+    for (ok, line), (status, payload) in zip(ev.run_cases(PACK, one), seen, strict=True):
+        runs.setdefault(int(line.split(" ", 1)[0][1:]), []).append((ok, line, status, payload))
+    return runs
 
 
-def _run_open(question: dict, post) -> dict:
-    ensure_local_mandate()
-    claims = _claims() if (STATE / "mandate.jwt").is_file() else {}
+def _with_eval(question: dict, runs: dict) -> dict:
+    lines = runs.get(question["n"], [])
+    if len(lines) != len(question["cases"]):
+        return {**question, "error": f"eval returned {len(lines)} lines for {len(question['cases'])} cases"}
+    cases = [
+        {**case, **_summarize(status, payload), "ok": ok, "report": line}
+        for case, (ok, line, status, payload) in zip(question["cases"], lines, strict=True)
+    ]
+    return {
+        **question,
+        "cases": cases,
+        "passed": sum(case["ok"] for case in cases),
+        "total": len(cases),
+        "ran": time.time(),
+    }
+
+
+def _with_probes(question: dict, post) -> dict:
+    live = _read_jwt(STATE / "mandate.jwt")
     cases = []
     for case in question["cases"]:
-        signed = _sign(case.get("mandate", "live"), case["tool"], case["arguments"])
-        status, payload = post(signed)
-        shown = _summarize(status, payload if isinstance(payload, dict) else {})
-        shown["result_flags"] = _result_flags(shown.get("columns") or [], case.get("sensitivity") or {})
-        extra = {}
+        key, path, _label = _mandate_for(case)
+        body = sign_request(
+            priv_from_pem(key.read_bytes()),
+            server=SERVER,
+            tool=case["tool"],
+            arguments=case["arguments"],
+            mandate=path.read_text().strip(),
+        )
+        status, payload = post(body)
+        shown = {**case, **_summarize(status, payload if isinstance(payload, dict) else {})}
+        if "expect" in case:
+            shown["ok"] = _met(case["expect"], shown)
         if question["n"] in {12, 13}:
-            extra["ignored_claim"] = {
-                "purpose": claims.get("purpose"),
-                "principal": (claims.get("delegator") or {}).get("principal"),
+            shown["ignored_claim"] = {
+                "purpose": live.get("purpose"),
+                "principal": (live.get("delegator") or {}).get("principal"),
             }
         if question["n"] in {14, 16}:
-            extra["audit_file"] = (STATE / "audit.jsonl").is_file()
-        cases.append({**case, **shown, **extra})
-    return {**question, "cases": cases, "passed": None, "total": len(cases)}
+            shown["audit_file"] = (STATE / "audit.jsonl").is_file()
+        cases.append(shown)
+    passed = sum(case["ok"] for case in cases) if question["state"] == "answered" else None
+    return {**question, "cases": cases, "passed": passed, "total": len(cases), "ran": time.time()}
 
 
 def execute(n: int, post) -> dict:
-    question = _question(n)
+    question = next((row for row in catalog() if row["n"] == n), None)
     if question is None:
         return {"error": "no such question"}
+    if question.get("error"):
+        return question
     if question["state"] == "solved":
-        if not PACK.is_dir():
-            return {**question, "error": "eval_pack is missing"}
-        return _run_eval(question, post)
-    if not (STATE / "agent.pem").is_file():
-        return {**question, "error": "team key is missing"}
-    return _run_open(question, post)
+        return _with_eval(question, _eval_runs(post))
+    return _with_probes(question, post)
+
+
+def execute_all(post) -> list[dict]:
+    questions = catalog()
+    if any(row.get("error") for row in questions):
+        return questions
+    runs = _eval_runs(post)
+    return [_with_eval(row, runs) if row["state"] == "solved" else _with_probes(row, post) for row in questions]
