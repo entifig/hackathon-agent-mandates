@@ -237,6 +237,56 @@ def test_clearance_required_and_denied_on_max(gw, tmp_path):
     assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "CLEARANCE_TOO_LOW")
 
 
+def test_aggregate_needs_same_clearance_as_direct_read(gw, tmp_path):
+    """Q8: you may only aggregate a measure you may also read row-by-row (same deny-on-max as Q6)."""
+    client, call, state = gw
+    agent = priv_from_pem((state / "agent.pem").read_bytes())
+
+    def counts(clearance, measure):
+        out = tmp_path / f"c{clearance}_{measure}.jwt"
+        scope = json.dumps(
+            [
+                {
+                    "server": "pupil-data",
+                    "tools": ["aggregate"],
+                    "constraints": {"table": [ev.CENSUS], "measure": [measure]},
+                }
+            ]
+        )
+        cli.main(
+            [
+                "--state",
+                str(state),
+                "issue",
+                "--agent-key",
+                str(state / "agent.pem"),
+                "--clearance",
+                str(clearance),
+                "--scope",
+                scope,
+                "-o",
+                str(out),
+            ]
+        )
+        body = cli.sign_request(
+            agent,
+            server="pupil-data",
+            tool="aggregate",
+            arguments={"table": ev.CENSUS, "group_by": ["URN"], "measure": measure},
+            mandate=out.read_text(),
+        )
+        return call(client, "aggregate", body=body)[0]
+
+    # FSMeligible is level 3: clearance 2 denies (would also deny reading the column), 3 allows exact counts
+    r = counts(2, "FSMeligible")
+    assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "CLEARANCE_TOO_LOW")
+    r = counts(3, "FSMeligible")
+    assert (r.status_code, r.json()["result"][0]["total"]) == (200, 617)
+    # InCareAtCurrentSchool is level 4: clearance 3 is not enough, aggregated or read directly
+    r = counts(3, "InCareAtCurrentSchool")
+    assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "CLEARANCE_TOO_LOW")
+
+
 def test_eval_set_passes_against_template_gateway(gw, tmp_path):
     client, _, state = gw
     ev.main(["build", "--state", str(state), "-o", str(tmp_path / "pack")])
