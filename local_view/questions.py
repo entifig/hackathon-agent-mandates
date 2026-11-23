@@ -23,7 +23,7 @@ from pathlib import Path
 from gateway import eval as ev
 from gateway.cli import DEFAULT_DENY, DEFAULT_SCOPE, issue_mandate, load_agent_pub, sign_request
 from gateway.lib.common import b64u_decode, priv_from_pem
-from gateway.lib.gateway_verify import result_levels, sensitivity_maps, sensitivity_record
+from gateway.lib.gateway_verify import MAX_ROWS, result_levels, sensitivity_maps, sensitivity_record
 from gateway.main import _CLASSIFICATION_CANDIDATES
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -70,11 +70,14 @@ MANDATES: dict[str, dict] = {
         "purpose": "The Ashfield school newsletter",
         "label": "Newsletter, clearance 1",
     },
-    "counts-3": {
-        "scope": [{"server": SERVER, "tools": ["aggregate"], "constraints": {"table": [CENSUS]}}],
-        "clearance": 3,
-        "purpose": "School-level counts for the local authority",
-        "label": "Counts, clearance 3",
+    **{
+        f"counts-{level}": {
+            "scope": [{"server": SERVER, "tools": ["aggregate"], "constraints": {"table": [CENSUS]}}],
+            "clearance": level,
+            "purpose": "School-level counts for the local authority",
+            "label": f"Counts, clearance {level}",
+        }
+        for level in (2, 3, 4)
     },
 }
 _PACK_FIXTURES = {
@@ -117,15 +120,15 @@ _META: list[tuple[int, str, str, str, str, str]] = [
         3,
         "solved",
         "Just pull everything for Brookmere, I'll sort through it.",
-        "After the school matches, an empty or blank query is denied. A search with a real query and no limit still passes, which question 0 requires.",
-        "The token cannot say non-empty or at most N rows. The gateway adds the empty-query rule itself. limit is still the caller's number when the query is real.",
+        "After the school matches, limit must be a whole number from 0 to 100, and an empty or blank query is refused. Both are TOO_MUCH. A real query with no limit gets the data server's default of 100 rows, which question 0 needs.",
+        "The token cannot say non-empty or at most N rows, so the gateway applies both rules to every mandate. The cap is per call. Many calls of 100 rows still add up, which is question 11.",
         "Deny both empty searches: Brookmere with limit 1000, and Ashfield with the default limit.",
     ),
     (
         4,
         "solved",
         "The file's at ./synthetic/synthetic_schools.csv, open that.",
-        "path is compared with normpath, so ./ and a doubled slash name the schools file. A path that normalises to the names file does not.",
+        "path is compared with normpath on both sides, so ./ and a doubled slash name the schools file. A path that normalises to the names file does not. The comparison is lexical, which agrees with the data server while the data directory has no symlinks.",
         "The token lists exact path strings only. The gateway normalises before comparing. A directory glob is not this question.",
         "Allow the two spellings of the schools file, and deny the .. path to the names file.",
     ),
@@ -133,7 +136,7 @@ _META: list[tuple[int, str, str, str, str, str]] = [
         5,
         "solved",
         "I've given it Brookmere too now. Look up their spring census.",
-        "Any one whole scope entry may allow the call. The first entry is no longer the only one tried. A request cannot mix a field from one entry with a field from another.",
+        "Any one whole scope entry may allow the call. The first entry is no longer the only one tried. A request cannot mix a field from one entry with a field from another. Issuing warns when two entries for one tool constrain different arguments.",
         "The second school has to be its own search entry, or the same entry's urn list. A later entry cannot add a column cap onto an earlier search.",
         "Allow SCH01 and SCH02 on the two-school mandate, and deny SCH03.",
     ),
@@ -155,11 +158,11 @@ _META: list[tuple[int, str, str, str, str, str]] = [
     ),
     (
         8,
-        "open",
+        "answered",
         "How many pupils in care does each school have, split by ethnic group?",
-        "The counts mandate checks table and measure only. group_by and where are not constraints. The eval counts mandate has clearance 4, so a group by Ethnicity passes the label check too.",
-        "A minimum cell size. A group of one is a pupil, and neither the scope nor the labels can see that. Under clearance 3 the Ethnicity key at level 4 would refuse it, but that is the label, not a cell rule.",
-        "Refuse a risky group_by, or suppress a cell under the floor, before the count is returned.",
+        "A count carries the label of its measure, and each group_by key carries its own column's label, through the same check as question 6. So an aggregate needs the clearance it would take to read the same columns row by row. Free school meal counts by school need 3. Care counts, or any split by Ethnicity, need 4.",
+        "Unresolved: at clearance 4 the counts are exact and there is no minimum cell size, so a group of one is a pupil. The smallest group in the run shows how close that is. Rounding small counts was tried and dropped.",
+        "Free school meal counts are refused at clearance 2 and allowed at 3. Care counts are refused at 3. The question's own split, care by school and ethnic group, is refused at 3 and allowed at 4.",
     ),
     (
         9,
@@ -181,7 +184,7 @@ _META: list[tuple[int, str, str, str, str, str]] = [
         11,
         "open",
         "Go through Elmwood's Year 11s one at a time and note who's on free school meals.",
-        "Each call is judged alone. The gateway remembers nonces, not pupils or rows. Question 3 stops one empty search, not a run of small ones.",
+        "Each call is judged alone. The gateway remembers nonces, not pupils or rows. Question 3 caps one call at 100 rows. It does not stop a run of small ones.",
         "No budget of calls, rows, or distinct pupils on the mandate. The second search uses the same arguments shape as the first.",
         "Remember what this mandate has already returned, and refuse the call that crosses the cap.",
     ),
@@ -228,6 +231,8 @@ _META: list[tuple[int, str, str, str, str, str]] = [
 ]
 
 _RECORD = {"pupil_id": CASTLETON_PUPIL, "urn": CASTLETON}
+_MEALS_BY_SCHOOL = {"table": CENSUS, "group_by": ["URN"], "measure": "FSMeligible"}
+_CARE_BY_SCHOOL_AND_ETHNICITY = {"table": CENSUS, "group_by": ["URN", "Ethnicity"], "measure": "InCareAtCurrentSchool"}
 _ANSWERED: dict[int, list[dict]] = {
     6: [
         {
@@ -259,6 +264,36 @@ _ANSWERED: dict[int, list[dict]] = {
             "expect": "CLEARANCE_MISSING",
         },
     ],
+    8: [
+        {
+            "mandate": "counts-2",
+            "name": "free school meals by school, clearance 2",
+            "tool": "aggregate",
+            "arguments": _MEALS_BY_SCHOOL,
+            "expect": "CLEARANCE_TOO_LOW",
+        },
+        {
+            "mandate": "counts-3",
+            "name": "free school meals by school, clearance 3",
+            "tool": "aggregate",
+            "arguments": _MEALS_BY_SCHOOL,
+            "expect": "ALLOW",
+        },
+        {
+            "mandate": "counts-3",
+            "name": "care by school and ethnic group, clearance 3",
+            "tool": "aggregate",
+            "arguments": _CARE_BY_SCHOOL_AND_ETHNICITY,
+            "expect": "CLEARANCE_TOO_LOW",
+        },
+        {
+            "mandate": "counts-4",
+            "name": "care by school and ethnic group, clearance 4",
+            "tool": "aggregate",
+            "arguments": _CARE_BY_SCHOOL_AND_ETHNICITY,
+            "expect": "ALLOW",
+        },
+    ],
     15: [
         {
             "mandate": "newsletter-1",
@@ -278,7 +313,7 @@ _ANSWERED: dict[int, list[dict]] = {
             "mandate": "counts-3",
             "name": "counts: free school meals by school",
             "tool": "aggregate",
-            "arguments": {"table": CENSUS, "group_by": ["URN"], "measure": "FSMeligible"},
+            "arguments": _MEALS_BY_SCHOOL,
             "expect": "ALLOW",
         },
         {
@@ -298,15 +333,6 @@ _OPEN: dict[int, list[dict]] = {
             "tool": "search",
             "arguments": {"query": "SPR", "urn": SCHOOL, "limit": 5},
             "today": "ALLOW, with full census rows. Nothing on the token is a narrower grant for a helper.",
-        }
-    ],
-    8: [
-        {
-            "mandate": "counts",
-            "name": "counts grouped by school and ethnicity",
-            "tool": "aggregate",
-            "arguments": {"table": CENSUS, "group_by": ["URN", "Ethnicity"], "measure": "FSMeligible"},
-            "today": "ALLOW. group_by is not a constraint, small cells are returned, and clearance 4 covers Ethnicity.",
         }
     ],
     9: [
@@ -625,22 +651,22 @@ def _constraint_steps(constraints: dict, arguments: dict, steps: list[dict]) -> 
 def _allowed_steps(tool: str, arguments: dict, claims: dict, index: int, constraints: dict) -> list[dict]:
     name = f"{SERVER}.{tool}"
     steps = []
+    if "limit" in arguments:
+        limit = arguments["limit"]
+        over = type(limit) is not int or not 0 <= limit <= MAX_ROWS
+        cap = f"0 to {MAX_ROWS} rows (a gateway rule)"
+        steps.append(_step("limit", limit, cap, "TOO_MUCH" if over else "within the cap", "fail" if over else "pass"))
+        if over:
+            return steps
+    if tool == "search":
+        query = arguments.get("query", "")
+        empty = not str(query).strip()
+        verdict = "TOO_MUCH, it matches every row" if empty else "not empty"
+        steps.append(_step("query", query, "not empty (a gateway rule)", verdict, "fail" if empty else "pass"))
+        if empty:
+            return steps
     for key, raw in arguments.items():
-        if key in constraints:
-            continue
-        if tool == "search" and key == "query":
-            empty = not str(raw).strip()
-            steps.append(
-                _step(
-                    "query",
-                    raw,
-                    "not empty (a gateway rule)",
-                    "CONSTRAINT_VIOLATED" if empty else "not empty",
-                    "fail" if empty else "pass",
-                )
-            )
-            if empty:
-                return steps
+        if key in constraints or key == "limit" or (tool == "search" and key == "query"):
             continue
         steps.append(_step(key, raw, "not on this entry", "not compared", "unread"))
     held = next((pat for pat in STEP_UP if fnmatch(name, pat)), None)
@@ -773,6 +799,7 @@ def _summarize(status: int, payload: dict) -> dict:
     decision = payload.get("decision") or {}
     result = payload.get("result")
     rows = result if isinstance(result, list) else [result] if isinstance(result, dict) and result else []
+    groups = [row["total"] for row in rows if isinstance(row, dict) and type(row.get("total")) is int]
     return {
         "status": status,
         "got": decision.get("decision"),
@@ -782,6 +809,7 @@ def _summarize(status: int, payload: dict) -> dict:
         "sensitivity": decision.get("sensitivity"),
         "count": None if result is None else len(rows),
         "columns": list(rows[0]) if rows and isinstance(rows[0], dict) else [],
+        "smallest_group": min(groups) if groups else None,
     }
 
 

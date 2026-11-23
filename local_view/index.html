@@ -177,6 +177,7 @@
   .verdict.fail { background: var(--deny-bg); color: var(--deny); }
   .run-top { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-bottom: 4px; }
   .detail { font-size: 12.5px; color: var(--ink-2); margin-top: 6px; }
+  .detail.warn-text { color: var(--hold); }
   .notice { font-size: 12.5px; margin-top: 8px; background: var(--info-bg); border-left: 3px solid var(--info); border-radius: 6px; padding: 6px 8px; color: var(--ink-2); }
   .notice b { display: block; color: var(--info); font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 2px; }
   .today { font-size: 13px; color: var(--ink-2); }
@@ -271,7 +272,7 @@ const STAGES = [
   {title: "Mandate", text: "Accredited issuer, signature, nbf and exp within 30 s, then the status bit.", codes: ["ISSUER_NOT_ACCREDITED", "SIG_INVALID", "NOT_YET_VALID", "EXPIRED", "REVOKED", "STATUS_UNAVAILABLE"]},
   {title: "Proof of possession", text: "Request signed by the key in cnf.jwk, a fresh nonce, time within 300 s.", codes: ["POP_FAILED"]},
   {title: "Clearance", text: "A level 1 to 4 must be on the mandate. Without one, the person is told which agent asked.", codes: ["CLEARANCE_MISSING", "CLEARANCE_INVALID"]},
-  {title: "Scope", text: "Deny patterns, then any one whole entry. Empty searches are refused, write and draft are held.", codes: ["DENIED_BY_RULE", "CONSTRAINT_MISSING", "CONSTRAINT_VIOLATED", "OUT_OF_SCOPE", "STEP_UP"]},
+  {title: "Scope", text: "Deny patterns, then any one whole entry. At most 100 rows and no empty search. write and draft are held.", codes: ["DENIED_BY_RULE", "CONSTRAINT_MISSING", "CONSTRAINT_VIOLATED", "OUT_OF_SCOPE", "TOO_MUCH", "STEP_UP"]},
   {title: "Data server", text: "The call is forwarded. The gateway holds the result before the agent sees it.", codes: []},
   {title: "Labels", text: "Every key of the result is looked up in the manifest. The highest level decides.", codes: ["CLEARANCE_TOO_LOW", "ALLOW"]},
 ];
@@ -453,6 +454,7 @@ function runCell(c) {
   const rows = c.count == null ? "" : ` · ${c.count} row${c.count === 1 ? "" : "s"}`;
   const notes = [];
   if (c.detail) notes.push(`<div class="detail">${esc(c.detail)}</div>`);
+  if (c.smallest_group != null) notes.push(`<div class="detail ${c.smallest_group < 10 ? "warn-text" : ""}">Smallest group: <b>${esc(c.smallest_group)}</b> pupil${c.smallest_group === 1 ? "" : "s"}. Counts are exact, with no minimum cell size.</div>`);
   if (c.notice) notes.push(`<div class="notice"><b>Notice for the person</b>${esc(c.notice)}</div>`);
   if (c.ignored_claim) notes.push(`<div class="detail">Signed and unread: purpose “${esc(c.ignored_claim.purpose)}”, principal <code>${esc(c.ignored_claim.principal)}</code>.</div>`);
   if (c.audit_file != null) notes.push(`<div class="detail">Audit file in gateway/state: <b>${c.audit_file ? "yes" : "none"}</b>.</div>`);
