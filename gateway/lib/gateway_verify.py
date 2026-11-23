@@ -40,6 +40,7 @@ class Decision:
     request_hash: str
     agent_id: str | None
     ts: float
+    clearance: int | None = None  # from the mandate; main.py enforces it against the result
     detail: str = ""
 
     def to_dict(self) -> dict:
@@ -150,6 +151,48 @@ def check_request(req: Request, scope: list[dict], deny: list[str], step_up_patt
     return "DENY", "OUT_OF_SCOPE", name
 
 
+# ---------------------------------------------------------------- classification (question 6)
+
+def sensitivity_maps(classification: dict) -> tuple[dict[str, int], dict[str, int]]:
+    """Column and table -> PII level, from the manifest's classification block."""
+    columns: dict[str, int] = {}
+    for cols in classification["columns"].values():
+        for col, level in cols.items():
+            columns[col] = max(columns.get(col, 0), level)
+    return columns, classification["tables"]
+
+
+def result_max_level(tool: str, arguments: dict, result, columns: dict[str, int],
+                     tables: dict[str, int], max_level: int) -> int:
+    """The highest sensitivity the result carries. Deny-on-max: this one number decides.
+
+    Unknown column keys fail closed at max_level: a column with no label is not public.
+    """
+    if result is None:
+        return 0
+    if tool == "get":
+        path = _norm_path(str(arguments.get("path", "")))
+        if not path.endswith(".csv"):
+            return 1
+        stem = path.rsplit("/", 1)[-1].removeprefix("synthetic_").removesuffix(".csv")
+        return tables.get(stem, max_level)
+    rows = result if isinstance(result, list) else [result]
+    return max((_key_level(k, arguments, columns, max_level)
+                for r in rows if isinstance(r, dict) for k in r), default=0)
+
+
+def _key_level(key: str, arguments: dict, columns: dict[str, int], max_level: int) -> int:
+    if key == "total":                                 # aggregate group size
+        return 1
+    if key == "count":                                 # aggregate: how many match `measure`
+        return columns.get(str(arguments.get("measure", "")), max_level)
+    if key in ("before", "after"):                     # write result echoes the corrected column
+        return columns.get(str(arguments.get("column", "")), max_level)
+    if key == "letter":                                # draft text embeds a display name
+        return 2
+    return columns.get(key, max_level)
+
+
 # ---------------------------------------------------------------- the pipeline
 
 class Gateway:
@@ -173,7 +216,15 @@ class Gateway:
                 raise Reject("POP_FAILED", f"bad signature for jkt {jwk_thumbprint(jwk)}")
             self._seen_nonces.add(req.nonce)
 
+            # Question 6: no clearance claim is an error, not an assumption. The caller
+            # fixes the mandate (re-issue with --claims '{"clearance": N}'), not the gateway.
+            clearance = claims.get("clearance")
+            if clearance is None:
+                raise Reject("CLEARANCE_MISSING", "re-issue the mandate with a clearance claim (1-4)")
+            if not isinstance(clearance, int) or not 1 <= clearance <= 4:
+                raise Reject("CLEARANCE_INVALID", f"clearance={clearance!r} outside 1-4")
+
             decision, code, detail = check_request(req, claims["scope"], claims["deny"], self.step_up)
-            return Decision(decision, code, agent_id=claims["agent_id"], detail=detail, **base)
+            return Decision(decision, code, agent_id=claims["agent_id"], clearance=clearance, detail=detail, **base)
         except Reject as r:
             return Decision("DENY", r.code, agent_id=None, detail=r.detail, **base)

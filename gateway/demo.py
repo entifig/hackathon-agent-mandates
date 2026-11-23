@@ -28,6 +28,7 @@ class MandateBody(BaseModel):
     tools: list[str] = ["search", "get", "greet"]
     deny: list[str] = ["*.write", "pii.*"]
     ttl: int = 3600
+    clearance: int = 4
 
 
 class RevokeBody(BaseModel):
@@ -89,6 +90,7 @@ def demo_mandate(body: MandateBody):
         purpose=f"Pupil-data lookups for school {body.urn}",
         principal="officer:jsmith",
         org=f"school:{body.urn}",
+        extra={"clearance": body.clearance},
     )
     (state_dir / "demo_mandate.jwt").write_text(token)
     return {

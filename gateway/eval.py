@@ -139,6 +139,8 @@ def cmd_build(a) -> None:
         "purpose": "eval set",
         "principal": "eval:runner",
         "org": "org:hackathon",
+        # the gateway requires a clearance claim; eval cases exercise scope, not sensitivity
+        "extra": {"clearance": 4},
     }
     (out / "valid.jwt").write_text(issue_mandate(state, agent.public_key(), ttl=a.ttl, **common)[0])
     token, idx = issue_mandate(state, agent.public_key(), ttl=a.ttl, **common)

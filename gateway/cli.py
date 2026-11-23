@@ -162,7 +162,7 @@ def cmd_issue(a) -> None:
         purpose=a.purpose,
         principal=a.principal,
         org=a.org,
-        extra=json.loads(a.claims),
+        extra={"clearance": a.clearance, **json.loads(a.claims)},
     )
     if a.out:
         a.out.write_text(token)
@@ -240,6 +240,13 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("issue", help="write a mandate for an agent key")
     s.add_argument("--agent-key", type=Path, required=True, help="the agent's public key (JWK or PEM)")
+    s.add_argument(
+        "--clearance",
+        type=int,
+        choices=[1, 2, 3, 4],
+        required=True,
+        help="PII level the agent may receive: 1 public to 4 special category (required)",
+    )
     s.add_argument("--scope", default=json.dumps(DEFAULT_SCOPE), help="what the agent may do (JSON)")
     s.add_argument("--deny", default=json.dumps(DEFAULT_DENY), help="what it must never do (JSON)")
     s.add_argument("--ttl", type=int, default=7200, help="seconds until it expires")

@@ -50,9 +50,11 @@ services:
       - "8082:8082"
     volumes:
       - ./gateway/state:/app/gateway/state
+      - ./mcp_server/data/synthetic/synthetic_manifest.json:/app/manifest.json:ro
     environment:
       - MCP_SERVERS=pupil-data=http://backend:8080/mcp/
       - GATEWAY_STATE_DIR=/app/gateway/state
+      - CLASSIFICATION_MANIFEST=/app/manifest.json
       - LITELLM_KEY=${LITELLM_KEY:-}
       - LITELLM_BASE_URL=${LITELLM_BASE_URL:-}
     healthcheck:

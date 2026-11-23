@@ -15,7 +15,17 @@ def gw(tmp_path, monkeypatch):
     state = tmp_path / "state"
     cli.main(["--state", str(state), "init"])
     cli.main(
-        ["--state", str(state), "issue", "--agent-key", str(state / "agent.pem"), "-o", str(state / "mandate.jwt")]
+        [
+            "--state",
+            str(state),
+            "issue",
+            "--agent-key",
+            str(state / "agent.pem"),
+            "--clearance",
+            "4",
+            "-o",
+            str(state / "mandate.jwt"),
+        ]
     )
     monkeypatch.setattr(main, "STATE_DIR", state)
     monkeypatch.setitem(main.MCP_SERVERS, "pupil-data", mcp)  # in-process upstream, no network
@@ -110,7 +120,19 @@ def test_describe_and_issue_to_public_jwk(gw, tmp_path, capsys):
     team_key = tmp_path / "team.pem"
     cli.main(["keygen", "-o", str(team_key)])
     (tmp_path / "team.jwk").write_text(capsys.readouterr().out)
-    cli.main(["--state", str(state), "issue", "--agent-key", str(tmp_path / "team.jwk"), "-o", str(tmp_path / "m.jwt")])
+    cli.main(
+        [
+            "--state",
+            str(state),
+            "issue",
+            "--agent-key",
+            str(tmp_path / "team.jwk"),
+            "--clearance",
+            "4",
+            "-o",
+            str(tmp_path / "m.jwt"),
+        ]
+    )
     body = cli.sign_request(
         priv_from_pem(team_key.read_bytes()),
         server="pupil-data",
@@ -125,14 +147,24 @@ def test_describe_and_issue_to_public_jwk(gw, tmp_path, capsys):
 def test_issue_with_claims_of_your_own(gw, tmp_path, capsys):
     client, call, state = gw
     out = tmp_path / "m.jwt"
-    issue = ["--state", str(state), "issue", "--agent-key", str(state / "agent.pem"), "-o", str(out)]
+    issue = [
+        "--state",
+        str(state),
+        "issue",
+        "--agent-key",
+        str(state / "agent.pem"),
+        "--clearance",
+        "4",
+        "-o",
+        str(out),
+    ]
 
     cli.main([*issue, "--claims", '{"clearance": 2}'])
     capsys.readouterr()
     cli.main(["decode", str(out)])
     assert json.loads(capsys.readouterr().out)["clearance"] == 2
 
-    # the starter gateway ignores a claim it does not read, so the mandate still works
+    # clearance 2 against census rows (level 4) is denied on max: the gateway now reads the claim
     body = cli.sign_request(
         priv_from_pem((state / "agent.pem").read_bytes()),
         server="pupil-data",
@@ -141,10 +173,68 @@ def test_issue_with_claims_of_your_own(gw, tmp_path, capsys):
         mandate=out.read_text(),
     )
     r, _ = call(client, "search", body=body)
-    assert (r.status_code, r.json()["decision"]["decision"]) == (200, "ALLOW")
+    assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "CLEARANCE_TOO_LOW")
 
     with pytest.raises(ValueError, match="scope"):
         cli.main([*issue, "--claims", '{"scope": []}'])
+
+
+def test_clearance_required_and_denied_on_max(gw, tmp_path):
+    client, call, state = gw
+    agent = priv_from_pem((state / "agent.pem").read_bytes())
+
+    # a mandate issued without the claim is an error the caller must fix, not a guess
+    token, _ = cli.issue_mandate(
+        state,
+        agent.public_key(),
+        scope=cli.DEFAULT_SCOPE,
+        deny=cli.DEFAULT_DENY,
+        ttl=3600,
+        purpose="no clearance",
+        principal="officer:jsmith",
+        org="school:SCH01",
+    )
+    body = cli.sign_request(
+        agent, server="pupil-data", tool="search", arguments={"query": ev.PUPIL, "urn": "SCH01"}, mandate=token
+    )
+    r, _ = call(client, "search", body=body)
+    assert r.json()["decision"]["reason_code"] == "CLEARANCE_MISSING"
+
+    # clearance 2: roster (names, level 2) is allowed, pupil (census, level 4) is denied on max
+    out = tmp_path / "low.jwt"
+    scope = json.dumps([{"server": "pupil-data", "tools": ["roster", "pupil"], "constraints": {"urn": ["SCH01"]}}])
+    cli.main(
+        [
+            "--state",
+            str(state),
+            "issue",
+            "--agent-key",
+            str(state / "agent.pem"),
+            "--clearance",
+            "2",
+            "--scope",
+            scope,
+            "-o",
+            str(out),
+        ]
+    )
+    mandate = out.read_text()
+    r, _ = call(
+        client,
+        "roster",
+        body=cli.sign_request(
+            agent, server="pupil-data", tool="roster", arguments={"urn": "SCH01", "year_group": 11}, mandate=mandate
+        ),
+    )
+    assert (r.status_code, r.json()["decision"]["decision"]) == (200, "ALLOW")
+    r, _ = call(
+        client,
+        "pupil",
+        body=cli.sign_request(
+            agent, server="pupil-data", tool="pupil", arguments={"pupil_id": ev.PUPIL, "urn": "SCH01"}, mandate=mandate
+        ),
+    )
+    assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "CLEARANCE_TOO_LOW")
 
 
 def test_eval_set_passes_against_template_gateway(gw, tmp_path):
