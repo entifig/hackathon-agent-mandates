@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mandate setup</title>
+<style>
+  :root {
+    --ink: #1c1915;
+    --muted: #5c564c;
+    --line: #d9d3c7;
+    --paper: #f6f3ec;
+    --card: #fffcf7;
+    --allow: #1d6b3a;
+    --deny: #9b2c2c;
+    --hold: #8a5a12;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font: 16px/1.45 ui-sans-serif, system-ui, sans-serif;
+  }
+  header, main { max-width: 1080px; margin: 0 auto; padding: 28px 20px; }
+  header { padding-bottom: 0; }
+  h1 { font-size: 28px; font-weight: 620; margin: 0 0 6px; letter-spacing: -0.02em; }
+  h2 { font-size: 15px; margin: 0 0 12px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
+  p.lead { margin: 0; color: var(--muted); max-width: 62ch; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
+  button, .pill {
+    border: 1px solid var(--line);
+    background: var(--card);
+    color: var(--ink);
+    border-radius: 999px;
+    padding: 6px 12px;
+    font: inherit;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--ink); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .wide { grid-column: 1 / -1; }
+  section {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 16px 18px;
+  }
+  .status { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; background: var(--muted); }
+  .dot.on { background: var(--allow); }
+  .dot.off { background: var(--deny); }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; vertical-align: top; padding: 6px 8px 6px 0; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 550; font-size: 13px; }
+  .tag { font-size: 12px; border-radius: 999px; padding: 1px 8px; border: 1px solid var(--line); }
+  .tag.private { color: var(--deny); }
+  pre {
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12.5px;
+    background: #f3efe6;
+    border-radius: 8px;
+    padding: 10px 12px;
+  }
+  .decision { font-weight: 650; }
+  .ALLOW { color: var(--allow); }
+  .DENY { color: var(--deny); }
+  .STEP_UP { color: var(--hold); }
+  ol { margin: 0; padding-left: 18px; }
+  li + li { margin-top: 6px; }
+  .tools { display: flex; flex-wrap: wrap; gap: 6px; }
+  .err { color: var(--deny); }
+  @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Mandate setup</h1>
+  <p class="lead">The pieces running on this machine. The pupil-data server has no access check. The gateway is the check. This page signs with the local team key and shows the decision.</p>
+  <div class="row">
+    <button type="button" id="refresh">Refresh</button>
+    <button type="button" id="eval">Run questions 0–5</button>
+  </div>
+</header>
+<main class="grid">
+  <section>
+    <h2>Pieces</h2>
+    <div id="pieces">Loading…</div>
+  </section>
+  <section>
+    <h2>A call</h2>
+    <ol>
+      <li>The issuer signs a mandate for one team key: tools, school, expiry.</li>
+      <li>The team key signs each request. The mandate alone is not enough.</li>
+      <li>The gateway checks the signature, the time, the status bit, then the scope.</li>
+      <li>Allow goes on to the pupil-data server. Deny stops here.</li>
+    </ol>
+  </section>
+  <section>
+    <h2>Issuer</h2>
+    <div id="issuer">Loading…</div>
+  </section>
+  <section>
+    <h2>Revocation</h2>
+    <div id="trust">Loading…</div>
+  </section>
+  <section class="wide">
+    <h2>Mandate in force</h2>
+    <div id="mandate">Loading…</div>
+  </section>
+  <section class="wide">
+    <h2>Tools</h2>
+    <div id="tools">Loading…</div>
+  </section>
+  <section class="wide">
+    <h2>Try the gateway</h2>
+    <div class="row" id="presets"></div>
+    <div id="result" style="margin-top:14px"></div>
+  </section>
+  <section class="wide">
+    <h2>Questions 0–5</h2>
+    <div id="evalout">Not run.</div>
+  </section>
+</main>
+<script>
+const presets = [
+  ["Search one pupil", "search", {query: "P0004", urn: "SCH01"}],
+  ["Empty search", "search", {query: "", urn: "SCH01"}],
+  ["Other school", "search", {query: "SPR", urn: "SCH02"}],
+  ["Schools file", "get", {path: "synthetic/synthetic_schools.csv"}],
+  ["Names file", "get", {path: "synthetic/synthetic_display_names.csv"}],
+  ["./ schools file", "get", {path: "./synthetic/synthetic_schools.csv"}],
+];
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+}
+
+async function getJson(url) {
+  const res = await fetch(url);
+  return res.json();
+}
+
+function when(seconds) {
+  if (!seconds) return "";
+  return new Date(seconds * 1000).toLocaleString();
+}
+
+function renderPieces(health) {
+  const mcp = health.mcp || {};
+  const gw = health.gateway || {};
+  const files = health.files || [];
+  const row = (on, name, url) => `<div class="status"><div><span class="dot ${on ? "on" : "off"}"></span>${esc(name)}</div><code>${esc(url)}</code></div>`;
+  const fileRows = files.map((f) => `<tr><td><code>${esc(f.name)}</code></td><td>${f.private ? '<span class="tag private">private</span>' : '<span class="tag">public</span>'}</td><td class="mono">${f.bytes}</td></tr>`).join("");
+  document.getElementById("pieces").innerHTML = `
+    ${row(mcp.up, "Pupil data", mcp.url || "")}
+    ${row(gw.up, "Gateway", gw.url || "")}
+    ${row(true, "This page", location.origin)}
+    <table style="margin-top:12px"><thead><tr><th>gateway/state</th><th></th><th>bytes</th></tr></thead><tbody>${fileRows}</tbody></table>`;
+}
+
+function renderIssuer(data) {
+  const box = document.getElementById("issuer");
+  if (!data || data.error) { box.innerHTML = `<p class="err">${esc(data && data.error)}</p>`; return; }
+  const issuer = data.issuer || {};
+  const jwk = issuer.public_jwk || {};
+  box.innerHTML = `<table>
+    <tr><th>iss</th><td><code>${esc(issuer.iss)}</code></td></tr>
+    <tr><th>kid</th><td><code>${esc(issuer.kid)}</code></td></tr>
+    <tr><th>public key</th><td><code>${esc(jwk.kty)} ${esc(jwk.crv)}</code><div class="mono">${esc(jwk.x)}</div></td></tr>
+    <tr><th>private key</th><td>On disk only. This page does not read it.</td></tr>
+  </table>`;
+}
+
+function renderTrust(data) {
+  const box = document.getElementById("trust");
+  if (!data || data.error) { box.innerHTML = `<p class="err">${esc(data && data.error)}</p>`; return; }
+  const list = data.status_list || {};
+  const revoked = (list.revoked || []).join(", ") || "none";
+  const issuers = Object.keys((data.trusted_list || {}).issuers || {});
+  box.innerHTML = `<table>
+    <tr><th>trusted issuers</th><td><code>${esc(issuers.join(", ") || "none")}</code></td></tr>
+    <tr><th>status uri</th><td><code>${esc(list.uri)}</code></td></tr>
+    <tr><th>issued</th><td>${esc(list.issued)}</td></tr>
+    <tr><th>revoked idx</th><td><code>${esc(revoked)}</code></td></tr>
+  </table>`;
+}
+
+function renderMandate(data) {
+  const box = document.getElementById("mandate");
+  if (!data || data.error) { box.innerHTML = `<p class="err">${esc(data && data.error)}</p>`; return; }
+  const c = data.claims || {};
+  const scope = (c.scope || []).map((entry) => {
+    const tools = (entry.tools || []).join(", ");
+    const limits = Object.entries(entry.constraints || {}).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join("; ");
+    return `<tr><td><code>${esc(entry.server)}.${esc(tools)}</code></td><td class="mono">${esc(limits || "no constraints")}</td></tr>`;
+  }).join("");
+  box.innerHTML = `<table>
+    <tr><th>purpose</th><td>${esc(c.purpose)}</td></tr>
+    <tr><th>principal</th><td><code>${esc((c.delegator || {}).principal)}</code></td></tr>
+    <tr><th>expires</th><td>${esc(when(c.exp))}</td></tr>
+    <tr><th>deny</th><td><code>${esc((c.deny || []).join(", "))}</code></td></tr>
+    <tr><th>status idx</th><td><code>${esc((c.status || {}).status_list && c.status.status_list.idx)}</code></td></tr>
+  </table>
+  <table style="margin-top:10px"><thead><tr><th>grant</th><th>constraints</th></tr></thead><tbody>${scope}</tbody></table>`;
+}
+
+function renderTools(data) {
+  const box = document.getElementById("tools");
+  const servers = (data && data.servers) || {};
+  const names = Object.entries(servers).flatMap(([server, tools]) => tools.map((t) => `${server}.${t.name}`));
+  if (!names.length) { box.innerHTML = `<p class="err">${esc((data && data.error) || "no tools")}</p>`; return; }
+  box.innerHTML = `<div class="tools">${names.map((n) => `<span class="tag">${esc(n)}</span>`).join("")}</div>
+    <p class="mono" style="color:var(--muted);margin:10px 0 0">Step-up: ${esc((data.step_up_patterns || []).join(", "))}</p>`;
+}
+
+function renderResult(data) {
+  const box = document.getElementById("result");
+  const body = data.body || {};
+  const decision = (body.decision || {}).decision || data.error || "—";
+  const code = (body.decision || {}).reason_code || "";
+  const count = data.result_count == null ? "" : ` · ${data.result_count} row${data.result_count === 1 ? "" : "s"}`;
+  box.innerHTML = `<div class="decision ${esc(decision)}">${esc(decision)} ${esc(code)}${esc(count)} · HTTP ${esc(data.status)}</div>
+    <pre style="margin-top:8px">${esc(JSON.stringify(body, null, 2))}</pre>`;
+}
+
+function renderEval(data) {
+  const box = document.getElementById("evalout");
+  if (data.error) { box.innerHTML = `<p class="err">${esc(data.error)}</p>`; return; }
+  const tally = (data.questions || []).map((q) => `Q${q.question} ${q.passed}/${q.total}`).join(" · ");
+  const lines = (data.lines || []).map((row) => `${row.ok ? "PASS" : "FAIL"} ${row.line}`).join("\n");
+  box.innerHTML = `<div class="decision ${data.passed === data.total ? "ALLOW" : "DENY"}">${data.passed}/${data.total}</div>
+    <p>${esc(tally)}</p><pre>${esc(lines)}</pre>`;
+}
+
+async function refresh() {
+  const [health, issuer, trust, mandate, describe] = await Promise.all([
+    getJson("/api/health"),
+    getJson("/api/issuer"),
+    getJson("/api/trust"),
+    getJson("/api/mandate"),
+    getJson("/api/describe"),
+  ]);
+  renderPieces(health);
+  renderIssuer(issuer);
+  renderTrust(trust);
+  renderMandate(mandate);
+  renderTools(describe);
+}
+
+async function runCall(tool, args) {
+  const res = await fetch("/api/call", {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify({tool, arguments: args})});
+  renderResult(await res.json());
+}
+
+document.getElementById("presets").innerHTML = presets.map(([label], i) => `<button type="button" data-i="${i}">${esc(label)}</button>`).join("");
+document.getElementById("presets").addEventListener("click", (event) => {
+  const button = event.target.closest("button");
+  if (!button) return;
+  const [, tool, args] = presets[Number(button.dataset.i)];
+  runCall(tool, args);
+});
+document.getElementById("refresh").addEventListener("click", refresh);
+document.getElementById("eval").addEventListener("click", async () => {
+  document.getElementById("evalout").textContent = "Running…";
+  const res = await fetch("/api/eval", {method: "POST"});
+  renderEval(await res.json());
+});
+refresh();
+</script>
+</body>
+</html>

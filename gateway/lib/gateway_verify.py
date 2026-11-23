@@ -12,6 +12,7 @@ count them. Order of checks is deliberate: cheapest and most definitive first.
 from __future__ import annotations
 
 import fnmatch
+import posixpath
 import time
 from dataclasses import asdict, dataclass
 
@@ -101,23 +102,51 @@ def verify_mandate(token: str, registry, status_lists: dict[str, str]) -> dict:
 
 # ---------------------------------------------------------------- scope
 
+# A wrong value is more useful than a missing one when several entries all fail.
+_FAIL_RANK = {"CONSTRAINT_VIOLATED": 2, "CONSTRAINT_MISSING": 1}
+
+
+def _norm_path(value: str) -> str:
+    """Same file, different spelling. `..` and absolute paths stay visibly out of the tree."""
+    return posixpath.normpath(value)
+
+
+def _constraint_holds(key: str, raw, allowed) -> bool:
+    if key == "path":
+        return _norm_path(str(raw)) in {_norm_path(str(item)) for item in allowed}
+    return str(raw) in {str(item) for item in allowed}
+
+
 def check_request(req: Request, scope: list[dict], deny: list[str], step_up_patterns: list[str]) -> tuple[str, str, str]:
     name = f"{req.server}.{req.tool}"
     for pat in deny:
         if fnmatch.fnmatch(name, pat):
             return "DENY", "DENIED_BY_RULE", pat
+    failure: tuple[str, str, str] | None = None
     for entry in scope:
         if entry["server"] != req.server or req.tool not in entry["tools"]:
             continue
-        for k, allowed in entry.get("constraints", {}).items():
-            if k not in req.arguments:
-                return "DENY", "CONSTRAINT_MISSING", k
-            if str(req.arguments[k]) not in set(map(str, allowed)):
-                return "DENY", "CONSTRAINT_VIOLATED", f"{k}={req.arguments[k]!r}"
+        entry_fail: tuple[str, str, str] | None = None
+        for key, allowed in entry.get("constraints", {}).items():
+            if key not in req.arguments:
+                entry_fail = ("DENY", "CONSTRAINT_MISSING", key)
+                break
+            if not _constraint_holds(key, req.arguments[key], allowed):
+                entry_fail = ("DENY", "CONSTRAINT_VIOLATED", f"{key}={req.arguments[key]!r}")
+                break
+        if entry_fail is not None:
+            if failure is None or _FAIL_RANK.get(entry_fail[1], 0) > _FAIL_RANK.get(failure[1], 0):
+                failure = entry_fail
+            continue
+        # An empty search matches every row of the granted school. Question 0 searches all have a query.
+        if req.tool == "search" and not str(req.arguments.get("query", "")).strip():
+            return "DENY", "CONSTRAINT_VIOLATED", "query"
         for pat in step_up_patterns:
             if fnmatch.fnmatch(name, pat):
                 return "STEP_UP", "SENSITIVE_TOOL", pat
         return "ALLOW", "IN_SCOPE", ""
+    if failure is not None:
+        return failure
     return "DENY", "OUT_OF_SCOPE", name
 
 
