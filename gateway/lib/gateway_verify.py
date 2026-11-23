@@ -42,9 +42,15 @@ class Decision:
     ts: float
     clearance: int | None = None  # from the mandate; main.py enforces it against the result
     detail: str = ""
+    notice: str = ""  # for the person whose data it is, when an agent asks without clearance
+    sensitivity: dict | None = None  # the labels on the result and the ones that decided
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        raw = asdict(self)
+        for key in ("notice", "sensitivity"):
+            if not raw[key]:
+                del raw[key]
+        return raw
 
 
 @dataclass
@@ -168,17 +174,43 @@ def result_max_level(tool: str, arguments: dict, result, columns: dict[str, int]
 
     Unknown column keys fail closed at max_level: a column with no label is not public.
     """
+    return max(result_levels(tool, arguments, result, columns, tables, max_level).values(), default=0)
+
+
+def result_levels(tool: str, arguments: dict, result, columns: dict[str, int],
+                  tables: dict[str, int], max_level: int) -> dict[str, int]:
+    """Each labelled part of the result and its level: a column, or the whole table for `get`."""
     if result is None:
-        return 0
+        return {}
     if tool == "get":
         path = _norm_path(str(arguments.get("path", "")))
         if not path.endswith(".csv"):
-            return 1
+            return {path: 1}
         stem = path.rsplit("/", 1)[-1].removeprefix("synthetic_").removesuffix(".csv")
-        return tables.get(stem, max_level)
+        return {stem: tables.get(stem, max_level)}
     rows = result if isinstance(result, list) else [result]
-    return max((_key_level(k, arguments, columns, max_level)
-                for r in rows if isinstance(r, dict) for k in r), default=0)
+    return {_key_name(k, arguments): _key_level(k, arguments, columns, max_level)
+            for r in rows if isinstance(r, dict) for k in r}
+
+
+def sensitivity_record(levels: dict[str, int], level_names: dict[int, str], clearance: int | None) -> dict:
+    """The decision's account of the result: every label, and the most restrictive ones, which decide."""
+    top = max(levels.values(), default=0)
+    return {
+        "level": top,
+        "label": level_names.get(top, "no labelled data"),
+        "clearance": clearance,
+        "decided_by": sorted(name for name, level in levels.items() if top and level == top),
+        "labels": levels,
+    }
+
+
+def _key_name(key: str, arguments: dict) -> str:
+    if key == "count":
+        return f"count ({arguments.get('measure', '')})"
+    if key in ("before", "after"):
+        return f"{key} ({arguments.get('column', '')})"
+    return key
 
 
 def _key_level(key: str, arguments: dict, columns: dict[str, int], max_level: int) -> int:
@@ -191,6 +223,16 @@ def _key_level(key: str, arguments: dict, columns: dict[str, int], max_level: in
     if key == "letter":                                # draft text embeds a display name
         return 2
     return columns.get(key, max_level)
+
+
+def no_clearance_notice(claims: dict, req: Request) -> str:
+    """What the person whose data it is should be told. The agent did prove who it is."""
+    principal = (claims.get("delegator") or {}).get("principal", "an unnamed principal")
+    return (
+        f"An authenticated agent ({claims['agent_id']}) acting for {principal} asked for "
+        f"{req.server}.{req.tool}. Its mandate has no clearance and no explicit consent from the person "
+        "whose data it is, so the gateway refused the call."
+    )
 
 
 # ---------------------------------------------------------------- the pipeline
@@ -220,7 +262,9 @@ class Gateway:
             # fixes the mandate (re-issue with --claims '{"clearance": N}'), not the gateway.
             clearance = claims.get("clearance")
             if clearance is None:
-                raise Reject("CLEARANCE_MISSING", "re-issue the mandate with a clearance claim (1-4)")
+                return Decision("DENY", "CLEARANCE_MISSING", agent_id=claims["agent_id"],
+                                detail="re-issue the mandate with a clearance claim (1-4)",
+                                notice=no_clearance_notice(claims, req), **base)
             if not isinstance(clearance, int) or not 1 <= clearance <= 4:
                 raise Reject("CLEARANCE_INVALID", f"clearance={clearance!r} outside 1-4")
 

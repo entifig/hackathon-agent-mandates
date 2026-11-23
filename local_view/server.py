@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT))
 from gateway.cli import sign_request  # noqa: E402
 from gateway.eval import run_cases  # noqa: E402
 from gateway.lib.common import b64u_decode, priv_from_pem  # noqa: E402
+from questions import catalog, ensure_local_mandate, execute  # noqa: E402
 
 STATE = ROOT / "gateway" / "state"
 PAGE = Path(__file__).with_name("index.html")
@@ -105,6 +106,7 @@ def mandate() -> dict:
     path = STATE / "mandate.jwt"
     if not path.is_file():
         return {"error": "no mandate.jwt"}
+    ensure_local_mandate()
     return _jwt_parts(path.read_text().strip())
 
 
@@ -183,6 +185,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/trust": lambda: _get(f"{GATEWAY}/demo/trust")[1],
             "/api/describe": lambda: _get(f"{GATEWAY}/describe", timeout=20)[1],
             "/api/mandate": mandate,
+            "/api/questions": lambda: {"questions": catalog()},
         }
         if self.path not in routes:
             self._send(404, {"error": "not found"}, "application/json")
@@ -203,7 +206,18 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/eval":
             self._send(HTTP_OK, eval_run(), "application/json")
             return
+        prefix = "/api/questions/"
+        if self.path.startswith(prefix) and self.path.endswith("/run"):
+            number = self.path[len(prefix) : -len("/run")]
+            if number.isdigit():
+                self._send(HTTP_OK, execute(int(number), _gateway_post), "application/json")
+                return
         self._send(404, {"error": "not found"}, "application/json")
+
+
+def _gateway_post(body: dict) -> tuple[int, dict]:
+    status, payload = _post(f"{GATEWAY}/tools/call", body)
+    return status, payload if isinstance(payload, dict) else {}
 
 
 def main() -> None:

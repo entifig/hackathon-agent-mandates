@@ -22,7 +22,21 @@
     color: var(--ink);
     font: 16px/1.45 ui-sans-serif, system-ui, sans-serif;
   }
-  header, main { max-width: 1080px; margin: 0 auto; padding: 28px 20px; }
+  header, main { max-width: 1180px; margin: 0 auto; padding: 28px 20px; }
+  table.q { width: 100%; }
+  table.q td { font-size: 14px; }
+  .solved { color: var(--allow); }
+  .open { color: var(--hold); }
+  tr.detail td { background: #f3efe6; }
+  button.run { border-radius: 8px; }
+  .lvl { display: inline-block; border-radius: 999px; padding: 0 6px; font-size: 12px; margin-right: 4px; }
+  .lvl-1 { background: #e4e0d6; }
+  .lvl-2 { background: #d5e4f2; }
+  .lvl-3 { background: #f3ddb0; }
+  .lvl-4 { background: #f3c7c3; }
+  .step { margin: 3px 0; }
+  .step b { font-weight: 650; }
+  .legend { margin: 0 0 10px; color: var(--muted); font-size: 14px; }
   header { padding-bottom: 0; }
   h1 { font-size: 28px; font-weight: 620; margin: 0 0 6px; letter-spacing: -0.02em; }
   h2 { font-size: 15px; margin: 0 0 12px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); }
@@ -80,13 +94,17 @@
 <body>
 <header>
   <h1>Mandate setup</h1>
-  <p class="lead">The pieces running on this machine. The pupil-data server has no access check. The gateway is the check. This page signs with the local team key and shows the decision.</p>
+  <p class="lead">Questions 0–5 have eval cases and pass on this gateway. Questions 6–16 have no cases: Run shows the decision the gateway makes today, and the row says which argument is still missing.</p>
   <div class="row">
     <button type="button" id="refresh">Refresh</button>
-    <button type="button" id="eval">Run questions 0–5</button>
   </div>
 </header>
 <main class="grid">
+  <section class="wide">
+    <h2>Questions</h2>
+    <p class="legend"><span class="lvl lvl-1">1 Public</span><span class="lvl lvl-2">2 Basic PII</span><span class="lvl lvl-3">3 Sensitive PII</span><span class="lvl lvl-4">4 Special category</span> The gateway does not read these labels.</p>
+    <div id="questions">Loading…</div>
+  </section>
   <section>
     <h2>Pieces</h2>
     <div id="pieces">Loading…</div>
@@ -116,26 +134,8 @@
     <h2>Tools</h2>
     <div id="tools">Loading…</div>
   </section>
-  <section class="wide">
-    <h2>Try the gateway</h2>
-    <div class="row" id="presets"></div>
-    <div id="result" style="margin-top:14px"></div>
-  </section>
-  <section class="wide">
-    <h2>Questions 0–5</h2>
-    <div id="evalout">Not run.</div>
-  </section>
 </main>
 <script>
-const presets = [
-  ["Search one pupil", "search", {query: "P0004", urn: "SCH01"}],
-  ["Empty search", "search", {query: "", urn: "SCH01"}],
-  ["Other school", "search", {query: "SPR", urn: "SCH02"}],
-  ["Schools file", "get", {path: "synthetic/synthetic_schools.csv"}],
-  ["Names file", "get", {path: "synthetic/synthetic_display_names.csv"}],
-  ["./ schools file", "get", {path: "./synthetic/synthetic_schools.csv"}],
-];
-
 function esc(value) {
   return String(value ?? "").replace(/[&<>]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
 }
@@ -218,23 +218,79 @@ function renderTools(data) {
     <p class="mono" style="color:var(--muted);margin:10px 0 0">Step-up: ${esc((data.step_up_patterns || []).join(", "))}</p>`;
 }
 
-function renderResult(data) {
-  const box = document.getElementById("result");
-  const body = data.body || {};
-  const decision = (body.decision || {}).decision || data.error || "—";
-  const code = (body.decision || {}).reason_code || "";
-  const count = data.result_count == null ? "" : ` · ${data.result_count} row${data.result_count === 1 ? "" : "s"}`;
-  box.innerHTML = `<div class="decision ${esc(decision)}">${esc(decision)} ${esc(code)}${esc(count)} · HTTP ${esc(data.status)}</div>
-    <pre style="margin-top:8px">${esc(JSON.stringify(body, null, 2))}</pre>`;
+function show(value) {
+  if (value == null) return "—";
+  return typeof value === "string" ? value : JSON.stringify(value);
 }
 
-function renderEval(data) {
-  const box = document.getElementById("evalout");
-  if (data.error) { box.innerHTML = `<p class="err">${esc(data.error)}</p>`; return; }
-  const tally = (data.questions || []).map((q) => `Q${q.question} ${q.passed}/${q.total}`).join(" · ");
-  const lines = (data.lines || []).map((row) => `${row.ok ? "PASS" : "FAIL"} ${row.line}`).join("\n");
-  box.innerHTML = `<div class="decision ${data.passed === data.total ? "ALLOW" : "DENY"}">${data.passed}/${data.total}</div>
-    <p>${esc(tally)}</p><pre>${esc(lines)}</pre>`;
+function level(n) {
+  if (n == null) return "";
+  return `<span class="lvl lvl-${n}">${n}</span>`;
+}
+
+function matchCell(c) {
+  const match = c.match || {};
+  const steps = (match.steps || []).map((step) => {
+    const line = `${esc(step.check)}: ${esc(show(step.value))} against ${esc(show(step.against))} → ${esc(step.result)}`;
+    return `<div class="step">${step.decides ? `<b>${line}</b>` : line}</div>`;
+  }).join("");
+  return `<div class="mono">${esc(match.label || "")}</div>${steps}`;
+}
+
+function sensCell(c) {
+  const sens = c.sensitivity || {};
+  const table = sens.table
+    ? `<div>${level(sens.table_level)}${esc(sens.table_label)} <span class="mono">${esc(sens.table)}</span></div>`
+    : `<div>No labelled table.</div>`;
+  const cols = (sens.columns || []).map((col) => `${level(col.level)}${esc(col.name)}`).join(" ");
+  const returned = (c.result_flags || []).map((col) => `${level(col.level)}${esc(col.name)}`).join(" ");
+  const back = returned ? `<div>Returned: ${returned}</div>` : "";
+  return `${table}<div>${cols}</div>${back}`;
+}
+
+function caseRows(q) {
+  return (q.cases || []).map((c) => {
+    const args = esc(JSON.stringify(c.arguments));
+    const outcome = c.report
+      ? `${c.ok ? "PASS" : "FAIL"} ${c.report}`
+      : (c.got ? `${c.got} ${c.reason || ""}` : "");
+    const count = c.count == null ? "" : ` · ${c.count} row(s)`;
+    const expect = c.expect ? `Expect ${c.expect}. ` : "";
+    const today = c.today || "";
+    return `<tr>
+      <td class="mono">${esc(c.name)}<br>${esc(c.tool)} ${args}</td>
+      <td>${matchCell(c)}</td>
+      <td>${sensCell(c)}</td>
+      <td>${esc(expect)}${esc(today)}</td>
+      <td class="${esc(c.got || "")}">${esc(outcome)}${esc(count)}</td>
+    </tr>`;
+  }).join("");
+}
+
+function renderQuestions(list) {
+  const body = list.map((q) => {
+    const tally = q.passed == null ? "" : ` ${q.passed}/${q.total}`;
+    return `<tr>
+      <td>${q.n}</td>
+      <td class="${esc(q.state)}">${esc(q.state)}${esc(tally)}</td>
+      <td>${esc(q.asks)}</td>
+      <td>${esc(q.binds)}</td>
+      <td>${esc(q.missing)}</td>
+      <td>${esc(q.solves)}</td>
+      <td><button type="button" class="run" data-run="${q.n}">Run</button></td>
+    </tr>
+    <tr class="detail"><td colspan="7"><table>
+      <thead><tr><th>Call</th><th>Matched against</th><th>Sensitivity</th><th>Criterion</th><th>This run</th></tr></thead>
+      <tbody>${caseRows(q) || "<tr><td colspan='5'>No cases.</td></tr>"}</tbody>
+    </table>${q.error ? `<p class="err">${esc(q.error)}</p>` : ""}</td></tr>`;
+  }).join("");
+  document.getElementById("questions").innerHTML = `<table class="q">
+    <thead><tr>
+      <th>#</th><th>State</th><th>The ask</th><th>How the decision is made</th>
+      <th>Arguments still missing</th><th>What implementing changes</th><th></th>
+    </tr></thead>
+    <tbody>${body}</tbody>
+  </table>`;
 }
 
 async function refresh() {
@@ -252,25 +308,29 @@ async function refresh() {
   renderTools(describe);
 }
 
-async function runCall(tool, args) {
-  const res = await fetch("/api/call", {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify({tool, arguments: args})});
-  renderResult(await res.json());
+let questions = [];
+
+async function loadQuestions() {
+  const data = await getJson("/api/questions");
+  questions = data.questions || [];
+  renderQuestions(questions);
 }
 
-document.getElementById("presets").innerHTML = presets.map(([label], i) => `<button type="button" data-i="${i}">${esc(label)}</button>`).join("");
-document.getElementById("presets").addEventListener("click", (event) => {
-  const button = event.target.closest("button");
+document.getElementById("questions").addEventListener("click", async (event) => {
+  const button = event.target.closest("button[data-run]");
   if (!button) return;
-  const [, tool, args] = presets[Number(button.dataset.i)];
-  runCall(tool, args);
+  const n = Number(button.dataset.run);
+  button.disabled = true;
+  button.textContent = "Running…";
+  const res = await fetch(`/api/questions/${n}/run`, {method: "POST"});
+  const row = await res.json();
+  const at = questions.findIndex((q) => q.n === n);
+  if (at >= 0) questions[at] = row;
+  renderQuestions(questions);
 });
-document.getElementById("refresh").addEventListener("click", refresh);
-document.getElementById("eval").addEventListener("click", async () => {
-  document.getElementById("evalout").textContent = "Running…";
-  const res = await fetch("/api/eval", {method: "POST"});
-  renderEval(await res.json());
-});
+document.getElementById("refresh").addEventListener("click", () => { refresh(); loadQuestions(); });
 refresh();
+loadQuestions();
 </script>
 </body>
 </html>

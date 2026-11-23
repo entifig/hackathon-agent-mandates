@@ -7,7 +7,7 @@ from gateway import cli, main
 from gateway import eval as ev
 from gateway.lib.common import priv_from_pem
 from gateway.lib.gateway_verify import Request
-from mcp_server.api.routes_mcp import mcp
+from mcp_server.api.routes_mcp import SYNTH_ROOT, mcp
 
 
 @pytest.fixture
@@ -234,6 +234,99 @@ def test_clearance_required_and_denied_on_max(gw, tmp_path):
             agent, server="pupil-data", tool="pupil", arguments={"pupil_id": ev.PUPIL, "urn": "SCH01"}, mandate=mandate
         ),
     )
+    assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "CLEARANCE_TOO_LOW")
+
+
+def _issue(state, out, clearance, scope=None):
+    argv = ["--state", str(state), "issue", "--agent-key", str(state / "agent.pem"), "--clearance", str(clearance)]
+    if scope is not None:
+        argv += ["--scope", json.dumps(scope)]
+    cli.main([*argv, "-o", str(out)])
+    return out.read_text()
+
+
+def test_no_clearance_is_told_and_the_stricter_label_decides(gw, tmp_path):
+    client, call, state = gw
+    agent = priv_from_pem((state / "agent.pem").read_bytes())
+    search = {"query": ev.PUPIL, "urn": "SCH01"}
+
+    token, _ = cli.issue_mandate(
+        state,
+        agent.public_key(),
+        scope=cli.DEFAULT_SCOPE,
+        deny=cli.DEFAULT_DENY,
+        ttl=3600,
+        purpose="no clearance",
+        principal="officer:jsmith",
+        org="school:SCH01",
+    )
+    r, _ = call(
+        client,
+        "search",
+        body=cli.sign_request(agent, server="pupil-data", tool="search", arguments=search, mandate=token),
+    )
+    d = r.json()["decision"]
+    assert (r.status_code, d["reason_code"]) == (403, "CLEARANCE_MISSING")
+    # signature and proof of possession passed, so the notice names the agent that asked
+    assert d["agent_id"]
+    assert d["agent_id"] in d["notice"]
+    assert "no clearance" in d["notice"]
+    assert "consent" in d["notice"]
+
+    # census rows carry URN at 1, Language at 3 and two columns at 4: the two at 4 decide
+    mandate = _issue(state, tmp_path / "two.jwt", 2)
+    r, _ = call(
+        client,
+        "search",
+        body=cli.sign_request(agent, server="pupil-data", tool="search", arguments=search, mandate=mandate),
+    )
+    assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "CLEARANCE_TOO_LOW")
+    assert "result" not in r.json()
+    s = r.json()["decision"]["sensitivity"]
+    assert (s["level"], s["clearance"], s["decided_by"]) == (4, 2, ["Ethnicity", "InCareAtCurrentSchool"])
+    assert (s["labels"]["URN"], s["labels"]["Language"]) == (1, 3)
+
+
+def test_counts_are_labelled_by_their_measure(gw, tmp_path):
+    client, call, state = gw
+    agent = priv_from_pem((state / "agent.pem").read_bytes())
+    scope = [{"server": "pupil-data", "tools": ["aggregate"], "constraints": {"table": [ev.CENSUS]}}]
+    mandate = _issue(state, tmp_path / "counts.jwt", 3, scope)
+
+    def count(measure):
+        args = {"table": ev.CENSUS, "group_by": ["URN"], "measure": measure}
+        body = cli.sign_request(agent, server="pupil-data", tool="aggregate", arguments=args, mandate=mandate)
+        return call(client, "aggregate", body=body)[0].json()["decision"]
+
+    d = count("FSMeligible")
+    assert (d["decision"], d["sensitivity"]["decided_by"]) == ("ALLOW", ["count (FSMeligible)"])
+    d = count("InCareAtCurrentSchool")
+    assert (d["reason_code"], d["sensitivity"]["decided_by"]) == (
+        "CLEARANCE_TOO_LOW",
+        ["count (InCareAtCurrentSchool)"],
+    )
+
+
+def test_labels_apply_on_the_next_call(gw, tmp_path, monkeypatch):
+    client, call, state = gw
+    agent = priv_from_pem((state / "agent.pem").read_bytes())
+    manifest = tmp_path / "manifest.json"
+    labels = json.loads((SYNTH_ROOT / "synthetic_manifest.json").read_text())
+    manifest.write_text(json.dumps(labels))
+    monkeypatch.setattr(main, "_CLASSIFICATION_CANDIDATES", [str(manifest)])
+    mandate = _issue(state, tmp_path / "one.jwt", 1)
+
+    def get_schools():
+        args = {"path": "synthetic/synthetic_schools.csv"}
+        body = cli.sign_request(agent, server="pupil-data", tool="get", arguments=args, mandate=mandate)
+        return call(client, "get", body=body)[0]
+
+    r = get_schools()
+    assert (r.status_code, r.json()["decision"]["sensitivity"]["level"]) == (200, 1)
+    # the label changes after the mandate was issued, and the running gateway uses the new one
+    labels["classification"]["tables"]["schools"] = 2
+    manifest.write_text(json.dumps(labels))
+    r = get_schools()
     assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "CLEARANCE_TOO_LOW")
 
 

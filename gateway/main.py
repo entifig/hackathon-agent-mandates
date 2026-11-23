@@ -18,7 +18,7 @@ from pydantic import BaseModel
 
 from gateway.cli import sign_request
 from gateway.lib.common import generate_keypair, pub_to_jwk
-from gateway.lib.gateway_verify import Gateway, Request, result_max_level, sensitivity_maps
+from gateway.lib.gateway_verify import Gateway, Request, result_levels, sensitivity_maps, sensitivity_record
 from gateway.lib.trust_registry import TrustedList
 
 STATE_DIR = Path(os.environ.get("GATEWAY_STATE_DIR", "gateway/state"))
@@ -51,6 +51,11 @@ def load_state(state_dir: Path) -> None:
     state["status_uri"] = json.loads((state_dir / "status_list.json").read_text())["uri"]
     state["dir"] = state_dir
     # Q6 labels live with the data; the gateway enforces them against results (deny on max)
+    load_labels()
+
+
+def load_labels() -> None:
+    """Read the first manifest found. Called on each forwarded call too, so a changed label needs no restart."""
     manifest = next((Path(p) for p in _CLASSIFICATION_CANDIDATES if p and Path(p).is_file()), None)
     if manifest is None:
         msg = f"no classification manifest under {_CLASSIFICATION_CANDIDATES}"
@@ -58,6 +63,7 @@ def load_state(state_dir: Path) -> None:
     classification = json.loads(manifest.read_text())["classification"]
     state["columns"], state["tables"] = sensitivity_maps(classification)
     state["max_level"] = max(map(int, classification["levels"]))
+    state["level_names"] = {int(level): name for level, name in classification["levels"].items()}
 
 
 @asynccontextmanager
@@ -134,14 +140,18 @@ async def tools_call(body: CallBody):
     except ToolError as e:
         return JSONResponse({"decision": record, "error": str(e)}, status_code=502)
     # Q6 deny on max: the most sensitive column in the result decides, against the mandate's clearance
-    level = result_max_level(
+    load_labels()
+    levels = result_levels(
         body.tool, body.arguments, result.data, state["columns"], state["tables"], state["max_level"]
     )
+    decision.sensitivity = sensitivity_record(levels, state["level_names"], decision.clearance)
+    level = decision.sensitivity["level"]
     if decision.clearance is not None and level > decision.clearance:
         decision.decision, decision.reason_code = "DENY", "CLEARANCE_TOO_LOW"
-        decision.detail = f"result reaches sensitivity {level} above clearance {decision.clearance}"
+        decided_by = ", ".join(decision.sensitivity["decided_by"])
+        decision.detail = f"result reaches sensitivity {level} above clearance {decision.clearance} ({decided_by})"
         return JSONResponse({"decision": decision.to_dict()}, status_code=403)
-    return {"decision": record, "result": result.data}
+    return {"decision": decision.to_dict(), "result": result.data}
 
 
 from gateway.demo import router as demo_router  # noqa: E402  (demo imports main lazily)
