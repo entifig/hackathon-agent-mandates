@@ -23,6 +23,9 @@ from .status_list import is_revoked
 
 POLICY_VERSION = "2026-11-18.1"
 CLOCK_SKEW = 30
+# Most rows one call may ask for (the MCP server's own default).
+# shortcut: per call only, many small calls still add up (question 11); add a per-mandate budget for that
+MAX_ROWS = 100
 
 
 class Reject(Exception):
@@ -42,9 +45,15 @@ class Decision:
     ts: float
     clearance: int | None = None  # from the mandate; main.py enforces it against the result
     detail: str = ""
+    notice: str = ""  # for the person whose data it is, when an agent asks without clearance
+    sensitivity: dict | None = None  # the labels on the result and the ones that decided
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        raw = asdict(self)
+        for key in ("notice", "sensitivity"):
+            if not raw[key]:
+                del raw[key]
+        return raw
 
 
 @dataclass
@@ -108,7 +117,10 @@ _FAIL_RANK = {"CONSTRAINT_VIOLATED": 2, "CONSTRAINT_MISSING": 1}
 
 
 def _norm_path(value: str) -> str:
-    """Same file, different spelling. `..` and absolute paths stay visibly out of the tree."""
+    """Same file, different spelling. `..` and absolute paths stay visibly out of the tree.
+
+    Lexical only: it agrees with the data server's resolve() while the data directory has no symlinks.
+    """
     return posixpath.normpath(value)
 
 
@@ -123,6 +135,8 @@ def check_request(req: Request, scope: list[dict], deny: list[str], step_up_patt
     for pat in deny:
         if fnmatch.fnmatch(name, pat):
             return "DENY", "DENIED_BY_RULE", pat
+    # Each entry is a whole grant: the call is allowed if any one entry accepts every argument it constrains,
+    # so a request cannot take urn from one entry and path from another.
     failure: tuple[str, str, str] | None = None
     for entry in scope:
         if entry["server"] != req.server or req.tool not in entry["tools"]:
@@ -139,16 +153,17 @@ def check_request(req: Request, scope: list[dict], deny: list[str], step_up_patt
             if failure is None or _FAIL_RANK.get(entry_fail[1], 0) > _FAIL_RANK.get(failure[1], 0):
                 failure = entry_fail
             continue
+        limit = req.arguments.get("limit", MAX_ROWS)
+        if type(limit) is not int or not 0 <= limit <= MAX_ROWS:
+            return "DENY", "TOO_MUCH", f"limit={limit!r}, at most {MAX_ROWS}"
         # An empty search matches every row of the granted school. Question 0 searches all have a query.
         if req.tool == "search" and not str(req.arguments.get("query", "")).strip():
-            return "DENY", "CONSTRAINT_VIOLATED", "query"
+            return "DENY", "TOO_MUCH", "empty query matches every row"
         for pat in step_up_patterns:
             if fnmatch.fnmatch(name, pat):
                 return "STEP_UP", "SENSITIVE_TOOL", pat
         return "ALLOW", "IN_SCOPE", ""
-    if failure is not None:
-        return failure
-    return "DENY", "OUT_OF_SCOPE", name
+    return failure or ("DENY", "OUT_OF_SCOPE", name)
 
 
 # ---------------------------------------------------------------- classification (question 6)
@@ -168,17 +183,43 @@ def result_max_level(tool: str, arguments: dict, result, columns: dict[str, int]
 
     Unknown column keys fail closed at max_level: a column with no label is not public.
     """
+    return max(result_levels(tool, arguments, result, columns, tables, max_level).values(), default=0)
+
+
+def result_levels(tool: str, arguments: dict, result, columns: dict[str, int],
+                  tables: dict[str, int], max_level: int) -> dict[str, int]:
+    """Each labelled part of the result and its level: a column, or the whole table for `get`."""
     if result is None:
-        return 0
+        return {}
     if tool == "get":
         path = _norm_path(str(arguments.get("path", "")))
         if not path.endswith(".csv"):
-            return 1
+            return {path: 1}
         stem = path.rsplit("/", 1)[-1].removeprefix("synthetic_").removesuffix(".csv")
-        return tables.get(stem, max_level)
+        return {stem: tables.get(stem, max_level)}
     rows = result if isinstance(result, list) else [result]
-    return max((_key_level(k, arguments, columns, max_level)
-                for r in rows if isinstance(r, dict) for k in r), default=0)
+    return {_key_name(k, arguments): _key_level(k, arguments, columns, max_level)
+            for r in rows if isinstance(r, dict) for k in r}
+
+
+def sensitivity_record(levels: dict[str, int], level_names: dict[int, str], clearance: int | None) -> dict:
+    """The decision's account of the result: every label, and the most restrictive ones, which decide."""
+    top = max(levels.values(), default=0)
+    return {
+        "level": top,
+        "label": level_names.get(top, "no labelled data"),
+        "clearance": clearance,
+        "decided_by": sorted(name for name, level in levels.items() if top and level == top),
+        "labels": levels,
+    }
+
+
+def _key_name(key: str, arguments: dict) -> str:
+    if key == "count":
+        return f"count ({arguments.get('measure', '')})"
+    if key in ("before", "after"):
+        return f"{key} ({arguments.get('column', '')})"
+    return key
 
 
 def _key_level(key: str, arguments: dict, columns: dict[str, int], max_level: int) -> int:
@@ -191,6 +232,16 @@ def _key_level(key: str, arguments: dict, columns: dict[str, int], max_level: in
     if key == "letter":                                # draft text embeds a display name
         return 2
     return columns.get(key, max_level)
+
+
+def no_clearance_notice(claims: dict, req: Request) -> str:
+    """What the person whose data it is should be told. The agent did prove who it is."""
+    principal = (claims.get("delegator") or {}).get("principal", "an unnamed principal")
+    return (
+        f"An authenticated agent ({claims['agent_id']}) acting for {principal} asked for "
+        f"{req.server}.{req.tool}. Its mandate has no clearance and no explicit consent from the person "
+        "whose data it is, so the gateway refused the call."
+    )
 
 
 # ---------------------------------------------------------------- the pipeline
@@ -220,7 +271,9 @@ class Gateway:
             # fixes the mandate (re-issue with --claims '{"clearance": N}'), not the gateway.
             clearance = claims.get("clearance")
             if clearance is None:
-                raise Reject("CLEARANCE_MISSING", "re-issue the mandate with a clearance claim (1-4)")
+                return Decision("DENY", "CLEARANCE_MISSING", agent_id=claims["agent_id"],
+                                detail="re-issue the mandate with a clearance claim (1-4)",
+                                notice=no_clearance_notice(claims, req), **base)
             if not isinstance(clearance, int) or not 1 <= clearance <= 4:
                 raise Reject("CLEARANCE_INVALID", f"clearance={clearance!r} outside 1-4")
 
