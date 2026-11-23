@@ -23,6 +23,9 @@ from .status_list import is_revoked
 
 POLICY_VERSION = "2026-11-18.1"
 CLOCK_SKEW = 30
+# Most rows one call may ask for (the MCP server's own default).
+# shortcut: per call only, many small calls still add up (question 11); add a per-mandate budget for that
+MAX_ROWS = 100
 
 
 class Reject(Exception):
@@ -114,7 +117,10 @@ _FAIL_RANK = {"CONSTRAINT_VIOLATED": 2, "CONSTRAINT_MISSING": 1}
 
 
 def _norm_path(value: str) -> str:
-    """Same file, different spelling. `..` and absolute paths stay visibly out of the tree."""
+    """Same file, different spelling. `..` and absolute paths stay visibly out of the tree.
+
+    Lexical only: it agrees with the data server's resolve() while the data directory has no symlinks.
+    """
     return posixpath.normpath(value)
 
 
@@ -129,6 +135,8 @@ def check_request(req: Request, scope: list[dict], deny: list[str], step_up_patt
     for pat in deny:
         if fnmatch.fnmatch(name, pat):
             return "DENY", "DENIED_BY_RULE", pat
+    # Each entry is a whole grant: the call is allowed if any one entry accepts every argument it constrains,
+    # so a request cannot take urn from one entry and path from another.
     failure: tuple[str, str, str] | None = None
     for entry in scope:
         if entry["server"] != req.server or req.tool not in entry["tools"]:
@@ -145,16 +153,17 @@ def check_request(req: Request, scope: list[dict], deny: list[str], step_up_patt
             if failure is None or _FAIL_RANK.get(entry_fail[1], 0) > _FAIL_RANK.get(failure[1], 0):
                 failure = entry_fail
             continue
+        limit = req.arguments.get("limit", MAX_ROWS)
+        if type(limit) is not int or not 0 <= limit <= MAX_ROWS:
+            return "DENY", "TOO_MUCH", f"limit={limit!r}, at most {MAX_ROWS}"
         # An empty search matches every row of the granted school. Question 0 searches all have a query.
         if req.tool == "search" and not str(req.arguments.get("query", "")).strip():
-            return "DENY", "CONSTRAINT_VIOLATED", "query"
+            return "DENY", "TOO_MUCH", "empty query matches every row"
         for pat in step_up_patterns:
             if fnmatch.fnmatch(name, pat):
                 return "STEP_UP", "SENSITIVE_TOOL", pat
         return "ALLOW", "IN_SCOPE", ""
-    if failure is not None:
-        return failure
-    return "DENY", "OUT_OF_SCOPE", name
+    return failure or ("DENY", "OUT_OF_SCOPE", name)
 
 
 # ---------------------------------------------------------------- classification (question 6)

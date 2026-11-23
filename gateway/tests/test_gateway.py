@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from gateway import cli, main
 from gateway import eval as ev
 from gateway.lib.common import priv_from_pem
-from gateway.lib.gateway_verify import Request
+from gateway.lib.gateway_verify import Request, check_request
 from mcp_server.api.routes_mcp import SYNTH_ROOT, mcp
 
 
@@ -60,6 +60,72 @@ def test_allow_deny_replay_revoke(gw):
     cli.main(["--state", str(state), "revoke", "--idx", "0"])
     r, _ = call(client, "search", query=ev.PUPIL, urn="SCH01")
     assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "REVOKED")
+
+
+def test_bulk_export_is_denied(gw):
+    client, call, _ = gw
+    for arguments in (
+        {"query": ""},
+        {"query": "  "},
+        {"query": "SPR", "limit": 101},
+        {"query": "SPR", "limit": "5"},
+        {"query": "SPR", "limit": -1},
+        {"query": "SPR", "limit": True},
+    ):
+        r, _ = call(client, "search", urn="SCH01", **arguments)
+        assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "TOO_MUCH"), arguments
+    r, _ = call(client, "search", urn="SCH01", query="SPR", limit=100)
+    assert r.status_code == 200, r.text
+
+
+def test_path_spellings(gw):
+    client, call, _ = gw
+    for path in ("./" + ev.SCHOOLS, ev.SCHOOLS.replace("/", "//"), "synthetic/x/../synthetic_schools.csv/"):
+        r, _ = call(client, "get", path=path)
+        assert r.status_code == 200, path
+        assert r.json()["result"][0]["URN"] == "SCH01"
+    for path in (
+        "synthetic/../synthetic/synthetic_display_names.csv",
+        "/" + ev.SCHOOLS,
+        "../data/" + ev.SCHOOLS,
+        ev.SCHOOLS + "/../synthetic_display_names.csv",
+        ev.SCHOOLS.upper(),
+        ev.SCHOOLS + "\x00",
+        "",
+        123,
+        [ev.SCHOOLS],
+    ):
+        r, _ = call(client, "get", path=path)
+        assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "CONSTRAINT_VIOLATED"), path
+
+
+def test_any_scope_entry_may_allow_but_entries_do_not_mix():
+    def check(tool="t", **arguments):
+        req = Request("s", tool, arguments, mandate="", nonce="", ts=0, sig="")
+        scope = [
+            {"server": "s", "tools": ["t"], "constraints": {"urn": ["SCH01"], "path": ["a"]}},
+            {"server": "s", "tools": ["t"], "constraints": {"urn": ["SCH02"], "path": ["b"]}},
+        ]
+        return check_request(req, scope, deny=[], step_up_patterns=[])[:2]
+
+    assert check(urn="SCH01", path="a") == ("ALLOW", "IN_SCOPE")
+    assert check(urn="SCH02", path="b") == ("ALLOW", "IN_SCOPE")  # the second entry is tried
+    assert check(urn="SCH01", path="b") == ("DENY", "CONSTRAINT_VIOLATED")  # urn from one, path from the other
+    assert check(urn="SCH03", path="a") == ("DENY", "CONSTRAINT_VIOLATED")
+    assert check(path="a") == ("DENY", "CONSTRAINT_MISSING")
+    assert check(urn="SCH02", path="b", limit=101) == ("DENY", "TOO_MUCH")
+    assert check(tool="other", urn="SCH01", path="a") == ("DENY", "OUT_OF_SCOPE")
+
+
+def test_issue_warns_when_entries_for_one_tool_constrain_different_arguments():
+    def entry(**constraints):
+        return {"server": "pupil-data", "tools": ["pupil"], "constraints": constraints}
+
+    assert cli.scope_warnings(cli.DEFAULT_SCOPE) == []
+    assert cli.scope_warnings(ev.TWO_SCHOOLS_SCOPE) == []  # same argument in both entries: a plain second grant
+    (warning,) = cli.scope_warnings([entry(urn=["SCH01"]), entry(pupil_id=["P0011"])])
+    assert "pupil-data.pupil" in warning
+    assert len(cli.scope_warnings([entry(urn=["SCH01"]), entry()])) == 1  # an unconstrained entry beside a narrow one
 
 
 def test_tampered_mandate_is_denied(gw):
