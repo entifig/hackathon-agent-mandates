@@ -87,6 +87,22 @@ def load_agent_pub(path: Path):
     return pub_from_pem(raw)
 
 
+def scope_warnings(scope: list[dict]) -> list[str]:
+    """Scope entries add up: the gateway allows a call if any one entry accepts it, and an entry only restricts
+    the arguments it names. Entries for one tool that constrain different arguments are usually a mistake."""
+    seen: dict[tuple[str, str], set[frozenset]] = {}
+    for entry in scope:
+        for tool in entry["tools"]:
+            seen.setdefault((entry["server"], tool), set()).add(frozenset(entry.get("constraints", {})))
+    return [
+        f"warning: {server}.{tool} has entries constraining different arguments "
+        f"({', '.join(str(sorted(k)) for k in sorted(keys, key=sorted))}); each entry is a separate grant, "
+        "so the tool is as wide as its loosest entry"
+        for (server, tool), keys in seen.items()
+        if len(keys) > 1
+    ]
+
+
 def issue_mandate(
     state: Path,
     agent_pub,
@@ -100,6 +116,8 @@ def issue_mandate(
     extra: dict | None = None,
 ) -> tuple[str, int]:
     """Issue a mandate from the state dir's issuer key. Returns (jwt, status-list index)."""
+    for warning in scope_warnings(scope):
+        print(warning, file=sys.stderr)
     status, meta = _load_status(state)
     idx = status._next  # noqa: SLF001
     token = MandateIssuer(meta["issuer"], meta["kid"], status.priv, status).issue(
