@@ -86,7 +86,9 @@ Defining a remote target (works the same when the stack runs under Docker via `m
 make attack_target URL=http://IP:PORT NAME=remote
 ```
 
-That writes `day_2_attack/targets/remote/target.json` (the endpoint). Everything below is gitignored; paste what applies:
+Or do it from the lab itself: the **Define a target** panel at the top of `/attack` takes the endpoint URL and a paste
+box for each file below, and writes the same folder server-side (the board is loopback-only, so the keys never leave the
+machine). Either way, everything below is gitignored; paste what applies:
 
 | File under `day_2_attack/targets/<name>/` | What it is | Unlocks |
 | --- | --- | --- |

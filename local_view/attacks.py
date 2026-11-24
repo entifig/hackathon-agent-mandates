@@ -30,6 +30,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sys
 import threading
@@ -850,6 +851,54 @@ def load_target(target_id: str, url: str | None = None) -> Target:
             agent_key = candidate
             break
     return Target(meta.get("label", target_id), url or meta.get("url", ""), "byo", mandates, agent_key, state_dir)
+
+
+# A pasted bundle maps to these fixed paths, so a folder name is the only free-form input. Keys land where
+# load_target and _byo_state look for them: a holder key beside the mandates, the minting bundle under state/.
+_TARGET_FILES = {
+    "default": "default.jwt",
+    "feature": "feature.jwt",
+    "agent": "agent.pem",
+    "state_issuer": "state/issuer_key.pem",
+    "state_agent": "state/agent.pem",
+    "state_status_json": "state/status_list.json",
+    "state_status_jwt": "state/status_list.jwt",
+    "state_trusted": "state/trusted_list.json",
+}
+_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,39}")
+
+
+def _safe_target_name(name: str) -> str:
+    name = (name or "").strip()
+    if name == "own" or not _NAME_RE.fullmatch(name):
+        msg = "target name must be 1-40 chars of letters, digits, - or _, and not 'own'"
+        raise ValueError(msg)
+    return name
+
+
+def save_target(name: str, url: str, files: dict) -> dict:
+    """Write a pasted target folder: target.json plus whatever bundle files were provided.
+
+    The file keys come from a fixed allowlist (_TARGET_FILES), so a caller can never write outside the
+    target's own folder. .pem files are written 0600. Empty fields are skipped, so re-saving with only a
+    URL leaves the keys in place.
+    """
+    name = _safe_target_name(name)
+    folder = TARGETS / name
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "target.json").write_text(json.dumps({"label": name, "url": (url or "").strip()}, indent=2))
+    written: list[str] = []
+    for key, rel in _TARGET_FILES.items():
+        content = (files or {}).get(key)
+        if not content or not content.strip():
+            continue
+        dest = folder / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content.strip() + "\n")
+        if rel.endswith(".pem"):
+            dest.chmod(0o600)
+        written.append(rel)
+    return {"name": name, "url": (url or "").strip(), "written": written, "can_mint": _byo_state(folder) is not None}
 
 
 # ---------------------------------------------------------------- catalogue

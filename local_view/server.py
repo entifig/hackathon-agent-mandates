@@ -104,10 +104,20 @@ GET_ROUTES = {
 }
 
 
-def _attack_post(path: str, body: dict) -> object:
-    # Saving a vector never touches a gateway, so it needs no target.
+def _attack_write(path: str, body: dict) -> object | None:
+    """Routes that write to disk and never touch a gateway, so they need no live target."""
     if path == "/api/attack/save-vector":
         return attacks.save_vector(body.get("spec") or {})
+    if path == "/api/attack/define-target":
+        saved = attacks.save_target(body.get("name", ""), body.get("url", ""), body.get("files") or {})
+        return {**saved, "targets": attacks.targets()}
+    return None
+
+
+def _attack_post(path: str, body: dict) -> object:
+    written = _attack_write(path, body)
+    if written is not None:
+        return written
     # URL precedence: an explicit per-request URL, then the target folder's url, then ATTACK_URL, then the
     # local gateway. So "own" fires at ATTACK_URL when set, and a remote target folder carries its own url.
     target = attacks.load_target(body.get("target", "own"), body.get("url") or None)

@@ -135,6 +135,15 @@
   .field label { font-size: 12px; color: var(--muted); font-weight: 600; }
   .field input, .field select, .field textarea { font: inherit; border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; background: var(--card); color: var(--ink); width: 100%; }
   .field textarea { font-family: var(--mono); font-size: 12px; resize: vertical; min-height: 44px; }
+  .deftarget { margin-top: 10px; background: rgba(255,255,255,.06); border: 1px solid rgba(255,255,255,.14); border-radius: 10px; padding: 8px 12px; }
+  .deftarget summary { cursor: pointer; font-size: 13px; color: var(--top-muted); }
+  .dt-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+  .dt-grid .field { display: flex; flex-direction: column; gap: 3px; }
+  .dt-grid .field > span { font-size: 11px; color: var(--top-muted); }
+  .dt-grid .wide { grid-column: 1 / -1; }
+  .dt-bundle { grid-column: 1 / -1; font-size: 12px; color: var(--top-muted); border-top: 1px solid rgba(255,255,255,.14); padding-top: 8px; }
+  .dt-actions { grid-column: 1 / -1; display: flex; align-items: center; gap: 10px; }
+  .dt-actions .small { color: var(--top-muted); }
   .field .hint { font-size: 11px; color: var(--muted); }
   fieldset { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin: 0 0 12px; }
   legend { font-size: 12px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); font-weight: 650; padding: 0 6px; }
@@ -216,6 +225,26 @@
       </div>
     </div>
     <div class="chips" id="chips"><span class="chip">Loading…</span></div>
+    <details class="deftarget" id="deftarget">
+      <summary>Define a target — paste an endpoint and its keys</summary>
+      <div class="dt-grid">
+        <label class="field"><span>Name (folder under day_2_attack/targets/)</span><input id="dt-name" placeholder="remote"></label>
+        <label class="field"><span>Endpoint URL</span><input id="dt-url" placeholder="http://IP:PORT"></label>
+        <label class="field wide"><span>agent.pem — holder key that signs requests</span><textarea id="dt-agent" rows="2" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></label>
+        <label class="field wide"><span>default.jwt — an issued mandate to attack</span><textarea id="dt-default" rows="2" placeholder="eyJ..."></textarea></label>
+        <label class="field wide"><span>feature.jwt — the feature mandate to attack</span><textarea id="dt-feature" rows="2" placeholder="eyJ..."></textarea></label>
+        <div class="dt-bundle">Minting bundle — paste a team's gateway/state to mint, forge and run the full catalogue against them. Leave blank to only attack the mandates above.</div>
+        <label class="field wide"><span>state/issuer_key.pem</span><textarea id="dt-state_issuer" rows="2" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></label>
+        <label class="field wide"><span>state/agent.pem — the bundle's holder key</span><textarea id="dt-state_agent" rows="2" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></label>
+        <label class="field wide"><span>state/status_list.json</span><textarea id="dt-state_status_json" rows="2" placeholder='{"uri": ...}'></textarea></label>
+        <label class="field wide"><span>state/status_list.jwt</span><textarea id="dt-state_status_jwt" rows="2" placeholder="eyJ..."></textarea></label>
+        <label class="field wide"><span>state/trusted_list.json</span><textarea id="dt-state_trusted" rows="2" placeholder='{"issuers": ...}'></textarea></label>
+        <div class="dt-actions">
+          <button type="button" class="primary" id="dt-save">Save target</button>
+          <span class="small" id="dt-msg"></span>
+        </div>
+      </div>
+    </details>
   </div>
 </header>
 
@@ -971,6 +1000,25 @@ async function loadTargets() {
   renderTargets();
 }
 
+const DT_KEYS = ["agent", "default", "feature", "state_issuer", "state_agent", "state_status_json", "state_status_jwt", "state_trusted"];
+
+async function saveTarget() {
+  const name = ($("dt-name").value || "").trim() || "remote";
+  const url = ($("dt-url").value || "").trim();
+  const files = {};
+  for (const k of DT_KEYS) { const v = ($("dt-" + k).value || "").trim(); if (v) files[k] = v; }
+  const msg = $("dt-msg");
+  msg.textContent = "Saving…";
+  const body = await post("/api/attack/define-target", {name, url, files});
+  if (!body || body.error) { msg.textContent = (body && body.error) || "save failed"; return; }
+  state.targets = body.targets || state.targets;
+  renderTargets();
+  $("target").value = body.name;
+  onTargetChange();
+  const wrote = body.written && body.written.length ? ` · wrote ${body.written.join(", ")}` : " · url only";
+  msg.textContent = `Saved “${body.name}”${wrote}${body.can_mint ? " · can mint" : ""}`;
+}
+
 async function loadVectors() {
   const body = await getJson("/api/attack/vectors");
   state.vectors = body.vectors || [];
@@ -1007,6 +1055,7 @@ document.addEventListener("click", (event) => {
   if (frow) { toggleFinding(frow.dataset.fid); return; }
 });
 $("target").addEventListener("change", onTargetChange);
+$("dt-save").addEventListener("click", saveTarget);
 $("url").addEventListener("change", renderChips);
 $("reload").addEventListener("click", loadVectors);
 $("run-all").addEventListener("click", runAll);
