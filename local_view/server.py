@@ -1,10 +1,11 @@
 """Local board for the running hackathon stack.
 
-Binds 127.0.0.1 only. Serves one page and talks to the gateway. Private keys
-stay on disk: the page receives claims, public JWKs, and call decisions.
+Serves one page and talks to the gateway. Private keys stay on disk: the page
+receives claims, public JWKs, and call decisions. On the host it binds
+127.0.0.1. Compose sets BOARD_HOST=0.0.0.0 and points GATEWAY_URL and MCP_URL
+at the gateway and backend services.
 
-The hackathon walkthrough in frontend/ is left as it shipped. This board is
-separate because that UI needs Node.
+The hackathon walkthrough in frontend/ is left as it shipped.
 
     uv run python local_view/server.py
 """
@@ -12,6 +13,7 @@ separate because that UI needs Node.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import urllib.error
@@ -27,10 +29,10 @@ from questions import catalog, execute, execute_all, labels_in_force, mandates  
 
 STATE = ROOT / "gateway" / "state"
 PAGE = Path(__file__).with_name("index.html")
-GATEWAY = "http://127.0.0.1:8082"
-MCP = "http://127.0.0.1:8080"
-HOST = "127.0.0.1"
-PORT = 8090
+GATEWAY = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8082")
+MCP = os.environ.get("MCP_URL", "http://127.0.0.1:8080")
+HOST = os.environ.get("BOARD_HOST", "127.0.0.1")
+PORT = int(os.environ.get("BOARD_PORT", "8090"))
 HTTP_OK = 200
 RUN_ONE = re.compile(r"^/api/questions/(\d+)/run$")
 
