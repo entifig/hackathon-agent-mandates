@@ -15,6 +15,7 @@ import fnmatch
 import posixpath
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import jwt
 
@@ -23,6 +24,7 @@ from .status_list import is_revoked
 
 POLICY_VERSION = "2026-11-18.1"
 CLOCK_SKEW = 30
+REPLAY_WINDOW = 300  # seconds a request's ts may be from the gateway's clock; a nonce is remembered that long
 # Most rows one call may ask for (the MCP server's own default).
 # shortcut: per call only, many small calls still add up (question 11); add a per-mandate budget for that
 MAX_ROWS = 100
@@ -344,28 +346,59 @@ def no_clearance_notice(claims: dict, req: Request) -> str:
 # ---------------------------------------------------------------- the pipeline
 
 class Gateway:
-    def __init__(self, registry, status_lists: dict[str, str], step_up_patterns: list[str] | None = None):
+    def __init__(self, registry, status_lists: dict[str, str], step_up_patterns: list[str] | None = None,
+                 nonce_log: Path | None = None):
         self.registry = registry
         self.status_lists = status_lists
         self.step_up = step_up_patterns or ["*.write", "*.draft"]
-        self._seen_nonces: set[str] = set()
+        # nonce digest -> the time its request leaves the window, after which a replay fails on ts anyway
+        self._seen_nonces: dict[str, int] = {}
+        self._nonce_log = nonce_log
+        if nonce_log is not None:
+            self._load_nonces(nonce_log)
+
+    def _load_nonces(self, log: Path) -> None:
+        """Nonces accepted before a restart or a state reload still count while their request is in the window.
+
+        shortcut: one file, one process. Replicas need a shared store. The file is trimmed here, not while running.
+        """
+        now = int(time.time())
+        for line in log.read_text().splitlines() if log.exists() else []:
+            expires, _, digest = line.partition(" ")
+            if expires.isdigit() and digest and int(expires) >= now:
+                self._seen_nonces[digest] = int(expires)
+        # written at start-up so a state dir that cannot be written fails here, not in the middle of a call
+        log.write_text("".join(f"{expires} {digest}\n" for digest, expires in self._seen_nonces.items()))
+
+    def _remember_nonce(self, digest: str, expires: int) -> None:
+        self._seen_nonces[digest] = expires
+        if self._nonce_log is not None:
+            with self._nonce_log.open("a") as log:
+                log.write(f"{expires} {digest}\n")
 
     def decide(self, req: Request) -> Decision:
-        base = dict(policy_version=POLICY_VERSION, mandate_hash=sha256_hex(req.mandate.encode()),
-                    request_hash=sha256_hex(req.signing_input()), ts=time.time())
+        # Everything in the request is the sender's. Text that cannot be hashed (a lone surrogate) is text no key
+        # signed, so it is a denial like any other and never an error page.
+        try:
+            base = dict(policy_version=POLICY_VERSION, mandate_hash=sha256_hex(req.mandate.encode()),
+                        request_hash=sha256_hex(req.signing_input()), ts=time.time())
+            nonce = sha256_hex(req.nonce.encode())
+        except ValueError as e:
+            return Decision("DENY", "REQUEST_MALFORMED", POLICY_VERSION, "", "", None, time.time(),
+                            detail=f"the request cannot be hashed: {type(e).__name__}")
         try:
             claims = verify_mandate(req.mandate, self.registry, self.status_lists)
             jwk = claims["cnf"]["jwk"]
-            if abs(req.ts - time.time()) > 300:
+            if abs(req.ts - int(time.time())) > REPLAY_WINDOW:      # whole seconds: a huge ts must not overflow
                 raise Reject("POP_FAILED", "request timestamp outside window")
-            if req.nonce in self._seen_nonces:
+            if nonce in self._seen_nonces:
                 raise Reject("POP_FAILED", "replayed nonce")
             if not verify_bytes(jwk_to_pub(jwk), req.signing_input(), req.sig):
                 raise Reject("POP_FAILED", f"bad signature for jkt {jwk_thumbprint(jwk)}")
-            self._seen_nonces.add(req.nonce)
+            self._remember_nonce(nonce, req.ts + REPLAY_WINDOW)
 
             # Question 6: no clearance claim is an error, not an assumption. The caller
-            # fixes the mandate (re-issue with --claims '{"clearance": N}'), not the gateway.
+            # fixes the mandate (re-issue with --clearance N), not the gateway.
             clearance = claims.get("clearance")
             if clearance is None:
                 return Decision("DENY", "CLEARANCE_MISSING", agent_id=claims["agent_id"],

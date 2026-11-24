@@ -140,22 +140,19 @@ def test_discovery_responses_keep_issuer_private_key_private(isolated_gateway, p
     assert b64u(issuer.private_bytes_raw()) not in response.text
 
 
-def test_public_demo_routes_can_mint_and_use_an_out_of_scope_mandate(isolated_gateway):
+def test_public_demo_routes_cannot_mint_or_use_an_out_of_scope_mandate(isolated_gateway):
+    # This was the finding: /demo/mandate signed a SCH04 mandate for anyone and /demo/call returned the flag row.
+    # The gateway now mounts those routes only with GATEWAY_DEMO=1, so the default gateway refuses each step.
     client, _, _, _, _, _, calls = isolated_gateway
     issued = client.post("/demo/mandate", json={"urn": "SCH04", "tools": ["search"], "clearance": 4})
-    assert issued.status_code == 200
-    assert issued.json()["claims"]["scope"][0]["constraints"]["urn"] == ["SCH04"]
+    assert issued.status_code in (401, 403, 404)
     response = client.post(
         "/demo/call",
         json={"tool": "search", "arguments": {"query": "P0011", "urn": "SCH04"}},
     )
-    assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == 200
-    assert body["response"]["decision"]["decision"] == "ALLOW"
-    assert body["response"]["result"] == [{"Psuedo ID": "P0011", "URN": "SCH04", "Ethnicity": "ASIA"}]
-    assert ("search", "P0011", "SCH04") in calls
-    assert issued.status_code in (401, 403, 404)
+    assert response.status_code in (401, 403, 404)
+    assert client.post("/demo/revoke", json={"idx": 0}).status_code in (401, 403, 404)
+    assert ("search", "P0011", "SCH04") not in calls
 
 
 @pytest.mark.parametrize("mandate", ["", "not-a-jwt", "a.b.c"])

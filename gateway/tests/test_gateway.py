@@ -1,11 +1,13 @@
 import json
 
+import jwt
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from gateway import cli, main
+from gateway import cli, demo, main
 from gateway import eval as ev
-from gateway.lib.common import priv_from_pem
+from gateway.lib.common import generate_keypair, priv_from_pem, priv_to_pem
 from gateway.lib.gateway_verify import Request, check_request
 from mcp_server.api.routes_mcp import SYNTH_ROOT, mcp
 
@@ -150,8 +152,13 @@ def test_tampered_mandate_is_denied(gw):
     assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "SIG_INVALID")
 
 
-def test_demo_walkthrough(gw):
-    client, _, _ = gw
+@pytest.mark.usefixtures("gw")  # it loads the state these routes read
+def test_demo_walkthrough():
+    # the gateway as GATEWAY_DEMO=1 runs it: the write routes are not on main.app by default (see the last tests)
+    demo_app = FastAPI()
+    demo_app.include_router(demo.router)
+    demo_app.include_router(demo.admin_router)
+    client = TestClient(demo_app)
     m = client.post("/demo/mandate", json={"urn": "SCH01"}).json()
     assert m["header"]["typ"] == "mandate+jwt"
     assert m["claims"]["scope"][0]["constraints"] == {"urn": ["SCH01"]}
@@ -314,12 +321,14 @@ def test_clearance_required_and_denied_on_max(gw, tmp_path):
     assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "CLEARANCE_TOO_LOW")
 
 
-def _issue(state, out, clearance, scope=None, role=None):
+def _issue(state, out, clearance, scope=None, role=None, *, role_ttl=None):
     argv = ["--state", str(state), "issue", "--agent-key", str(state / "agent.pem"), "--clearance", str(clearance)]
     if scope is not None:
         argv += ["--scope", json.dumps(scope)]
     if role is not None:
         argv += ["--role", role]
+    if role_ttl is not None:
+        argv += ["--role-ttl", str(role_ttl)]
     cli.main([*argv, "-o", str(out)])
     return out.read_text()
 
@@ -611,6 +620,106 @@ def test_a_refusal_does_not_say_whether_a_row_matched(gw, tmp_path):
 
     assert get("synthetic/synthetic_manifest.json") == (200, "IN_SCOPE")
     assert get("writes/corrections.jsonl") == (403, "CLEARANCE_TOO_LOW")
+
+
+def test_a_role_can_end_before_the_mandate_does(gw, tmp_path):
+    client, call, state = gw
+    agent = priv_from_pem((state / "agent.pem").read_bytes())
+
+    def search(mandate, query=ev.PUPIL):
+        args = {"query": query, "urn": "SCH01"}
+        body = cli.sign_request(agent, server="pupil-data", tool="search", arguments=args, mandate=mandate)
+        r = call(client, "search", body=body)[0]
+        return r.status_code, r.json()["decision"]["reason_code"]
+
+    assert search(_issue(state, tmp_path / "held.jwt", 4, role=ROLE, role_ttl=600)) == (200, "IN_SCOPE")
+    # the person left the role a minute ago: level 4 closes, whether or not a row matches
+    ended = _issue(state, tmp_path / "ended.jwt", 4, role=ROLE, role_ttl=-60)
+    assert search(ended) == search(ended, "no-such-row") == (403, "ROLE_EXPIRED")
+    # the mandate itself is still in date, so what needs no role keeps working: meal counts are level 3
+    counts = _issue(state, tmp_path / "counts.jwt", 4, _COUNTS_SCOPE, role=ROLE, role_ttl=-60)
+    assert _aggregate(client, call, agent, counts, group_by=["URN"]).status_code == 200
+
+    # an end date with no role to end is the issuer's mistake, at the command line and at the gateway
+    with pytest.raises(ValueError, match="needs --role"):
+        _issue(state, tmp_path / "no_role.jwt", 4, role_ttl=600)
+    with pytest.raises(ValueError, match="--role-ttl"):
+        cli.main(
+            [
+                *["--state", str(state), "issue", "--agent-key", str(state / "agent.pem"), "--clearance", "4"],
+                *["--role", ROLE, "--claims", '{"role_exp": 9999999999}', "-o", str(tmp_path / "claim.jwt")],
+            ]
+        )
+    for extra in ({"role": ROLE, "role_exp": "tomorrow"}, {"role": ROLE, "role_exp": True}, {"role_exp": 9999999999}):
+        token, _ = cli.issue_mandate(
+            state,
+            agent.public_key(),
+            scope=cli.DEFAULT_SCOPE,
+            deny=cli.DEFAULT_DENY,
+            ttl=3600,
+            purpose="bad role_exp",
+            principal="officer:jsmith",
+            org="school:SCH01",
+            extra={"clearance": 4, **extra},
+        )
+        body = cli.sign_request(agent, server="pupil-data", tool="get", arguments={"path": ev.SCHOOLS}, mandate=token)
+        r, _ = call(client, "get", body=body)
+        assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "ROLE_INVALID"), extra
+
+
+def test_what_the_sender_controls_is_denied_and_never_an_error_page(gw, tmp_path):
+    client, call, state = gw
+    agent = priv_from_pem((state / "agent.pem").read_bytes())
+    mandate = (state / "mandate.jwt").read_text()
+
+    def sent(**change):
+        body = cli.sign_request(agent, server="pupil-data", tool="get", arguments={"path": ev.SCHOOLS}, mandate=mandate)
+        # sent as bytes: json.dumps escapes a lone surrogate, which the client's own encoder would refuse to send
+        raw = json.dumps({**body, **change}).encode()
+        r = client.post("/tools/call", content=raw, headers={"content-type": "application/json"})
+        return r.status_code, r.json()["decision"]["reason_code"]
+
+    # none of these needs a mandate or a key, so anyone can send them
+    stranger, _ = generate_keypair()
+    no_issuer = jwt.encode(
+        {"exp": 9999999999}, priv_to_pem(stranger), algorithm="EdDSA", headers={"typ": "mandate+jwt"}
+    )
+    for token in ("", "not-a-jwt", "a.b.c", no_issuer):
+        assert sent(mandate=token) == (403, "MANDATE_MALFORMED"), token
+    assert sent(ts=10**400) == (403, "POP_FAILED")
+    assert sent(arguments={"path": "\ud800"}) == (403, "REQUEST_MALFORMED")  # text no key could have signed
+
+    # aggregate arguments that are not column names are labelled at the top level, then refused like any other
+    for clearance, role, expected in ((3, None, {403}), (4, ROLE, {502})):
+        counts = _issue(state, tmp_path / f"counts{clearance}.jwt", clearance, _COUNTS_SCOPE, role=role)
+        for group_by in ([["URN"]], [1, "Ethnicity"], [None]):
+            assert _aggregate(client, call, agent, counts, group_by=group_by).status_code in expected, group_by
+
+
+def test_a_replay_is_refused_after_the_gateway_restarts(gw):
+    client, call, state = gw
+    r, body = call(client, "get", path=ev.SCHOOLS)
+    assert r.status_code == 200
+    main.load_state(state)  # what a restart does: a new Gateway, with nothing in memory
+    r, _ = call(client, "get", body=body)
+    assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "POP_FAILED")
+    # only a digest of the nonce is kept, and only until its request is too old to be accepted anyway
+    log = (state / "seen_nonces.log").read_text()
+    assert body["nonce"] not in log
+    assert [int(line.split()[0]) for line in log.splitlines()] == [body["ts"] + 300]
+
+
+def test_the_demo_cannot_issue_revoke_or_call_unless_switched_on(gw):
+    client, _, _ = gw
+    # reading what is public stays: the board uses these two
+    assert [client.get(path).status_code for path in ("/demo/issuer", "/demo/trust")] == [200, 200]
+    # signing a mandate for any school, revoking any mandate and signing calls are GATEWAY_DEMO=1 only
+    for path, body in (
+        ("/demo/mandate", {"urn": "SCH04"}),
+        ("/demo/revoke", {"idx": 0}),
+        ("/demo/call", {"tool": "greet"}),
+    ):
+        assert client.post(path, json=body).status_code == 404, path
 
 
 def test_eval_set_passes_against_template_gateway(gw, tmp_path):

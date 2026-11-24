@@ -55,6 +55,8 @@ services:
       - MCP_SERVERS=pupil-data=http://backend:8080/mcp/
       - GATEWAY_STATE_DIR=/app/gateway/state
       - CLASSIFICATION_MANIFEST=/app/manifest.json
+      # 1 mounts the demo UI's write routes (issue, revoke, call). Local walkthrough only, never on a posted gateway
+      - GATEWAY_DEMO=${GATEWAY_DEMO:-}
       - LITELLM_KEY=${LITELLM_KEY:-}
       - LITELLM_BASE_URL=${LITELLM_BASE_URL:-}
     healthcheck:

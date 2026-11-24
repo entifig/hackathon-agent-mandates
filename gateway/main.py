@@ -59,8 +59,9 @@ class CallBody(BaseModel):
 
 def load_state(state_dir: Path) -> None:
     registry = TrustedList(json.loads((state_dir / "trusted_list.json").read_text()))
-    # shortcut: nonce replay set lives in Gateway._seen_nonces, in-memory per process; share it before multi-replica
-    state["gateway"] = Gateway(registry, status_lists={})
+    # accepted nonces are kept in the state dir, so a restart or a reload does not reopen the replay window.
+    # shortcut: one file for one process; share it before multi-replica
+    state["gateway"] = Gateway(registry, status_lists={}, nonce_log=state_dir / "seen_nonces.log")
     state["status_uri"] = json.loads((state_dir / "status_list.json").read_text())["uri"]
     state["dir"] = state_dir
     # Q6 labels live with the data; the gateway enforces them against results (deny on max)
@@ -236,6 +237,11 @@ async def tools_call(body: CallBody):
     return {"decision": decision.to_dict(), "result": data}
 
 
-from gateway.demo import router as demo_router  # noqa: E402  (demo imports main lazily)
+from gateway.demo import admin_router as demo_admin_router  # noqa: E402  (demo imports main lazily)
+from gateway.demo import router as demo_router  # noqa: E402
 
 app.include_router(demo_router)
+# The walkthrough's write routes sign a mandate for any school with the issuer key, revoke any mandate and sign
+# calls with a key the gateway holds, for whoever asks. They exist for the local demo UI only: off unless asked for.
+if os.environ.get("GATEWAY_DEMO") == "1":
+    app.include_router(demo_admin_router)
