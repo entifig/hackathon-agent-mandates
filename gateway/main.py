@@ -30,6 +30,7 @@ from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
 
 from gateway.cli import sign_request
+from gateway.lib import audit  # AUDIT(q14/q16)
 from gateway.lib.budget import ID_BOUNDED_TOOLS, Budget, Ledger, LedgerUnavailable, parse_budget, pupil_ids
 from gateway.lib.common import generate_keypair, pub_to_jwk
 from gateway.lib.gateway_verify import MAX_TS, Decision, Gateway, Request, normalised_arguments
@@ -86,10 +87,12 @@ def state_dir_unwritable(state_dir: Path) -> str | None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     load_state(STATE_DIR)
+    state["audit_error"] = audit.startup_check(STATE_DIR)  # AUDIT(q14/q16): unwritable log -> /healthcheck 503
     yield
 
 
 app = FastAPI(title="mandate gateway", lifespan=lifespan)
+app.add_middleware(audit.ClientAddress)  # AUDIT(q14/q16): source address for the audit entry
 
 
 @app.middleware("http")
@@ -111,6 +114,8 @@ def healthcheck():
     gateway = state.get("gateway")
     if reason := state.get("state_dir_error") or (gateway and gateway.nonces.error):
         return JSONResponse({"status": "error", "reason": reason}, status_code=503)
+    if state.get("audit_error"):  # AUDIT(q14/q16): fail visibly, the gateway would deny every call
+        return JSONResponse({"status": "error", "reason": state["audit_error"]}, status_code=503)
     return {"status": "ok"}
 
 
@@ -151,6 +156,7 @@ async def describe() -> dict:
 
 
 @app.post("/tools/call")
+@audit.audited(state)  # AUDIT(q14/q16): answers gateway.audit, logs every call before its response goes out
 async def tools_call(body: CallBody):
     gateway: Gateway = state["gateway"]
     # re-read the published status list each request so `cli revoke` applies without a restart
@@ -158,7 +164,7 @@ async def tools_call(body: CallBody):
 
     decision, claims = gateway.decide_with_claims(Request(**body.model_dump()))
     record = decision.to_dict()
-    # no audit trail: teams write their own decision record here (e.g. state["dir"] / "audit.jsonl")
+    # audit trail: written by @audit.audited (gateway/lib/audit.py) after this returns, before the response
 
     if decision.decision == "DENY":
         return JSONResponse({"decision": record}, status_code=403)

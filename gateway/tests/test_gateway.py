@@ -535,10 +535,10 @@ def test_unwritable_state_dir_fails_the_healthcheck_not_the_gateway(gw, issue, f
             r = restarted.get("/healthcheck")
             assert r.status_code == 503
             assert "not writable" in r.json()["reason"]
-            # nonces cannot be recorded, so a replay could not be stopped: every call is refused, budget or not
-            assert reason(plain("search", client=restarted, query="P1022", urn=ELMWOOD)) == (403, "NONCE_UNAVAILABLE")
-            r = budgeted("search", client=restarted, query="P1022", urn=ELMWOOD)
-            assert reason(r) == (403, "NONCE_UNAVAILABLE")
+            # nonces (and the audit log) cannot be recorded: every call is refused, budget or not
+            refused = {(403, "NONCE_UNAVAILABLE"), (403, "AUDIT_UNAVAILABLE")}  # whichever layer fails first
+            assert reason(plain("search", client=restarted, query="P1022", urn=ELMWOOD)) in refused
+            assert reason(budgeted("search", client=restarted, query="P1022", urn=ELMWOOD)) in refused
     finally:
         state.chmod(0o755)
     assert forwarded == []
