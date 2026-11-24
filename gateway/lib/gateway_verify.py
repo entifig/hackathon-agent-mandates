@@ -33,6 +33,11 @@ MAX_ROWS = 100
 SMALL_COUNT = 10
 # Columns that name one pupil: an aggregate grouped or filtered by one is that pupil's record.
 IDENTIFIERS = frozenset({"Psuedo ID", "DisplayName"})
+# A result at PRIVATE_LEVEL needs one of PRIVATE_ROLES as well as the clearance. The issuer signs the role the person
+# holds into the agent's mandate; the gateway says which roles open the data. main.py lets GATEWAY_PRIVATE_ROLES
+# replace the list; no mandate claim can.
+PRIVATE_LEVEL = 4
+PRIVATE_ROLES = frozenset({"safeguarding-lead"})
 
 
 class Reject(Exception):
@@ -51,6 +56,7 @@ class Decision:
     agent_id: str | None
     ts: float
     clearance: int | None = None  # from the mandate; main.py enforces it against the result
+    role: str | None = None  # from the mandate; main.py checks it when the result reaches PRIVATE_LEVEL
     detail: str = ""
     notice: str = ""  # for the person whose data it is, when an agent asks without clearance
     sensitivity: dict | None = None  # the labels on the result and the ones that decided
@@ -58,7 +64,7 @@ class Decision:
 
     def to_dict(self) -> dict:
         raw = asdict(self)
-        for key in ("notice", "sensitivity", "disclosure"):
+        for key in ("role", "notice", "sensitivity", "disclosure"):
             if not raw[key]:
                 del raw[key]
         return raw
@@ -312,8 +318,12 @@ class Gateway:
                                 notice=no_clearance_notice(claims, req), **base)
             if not isinstance(clearance, int) or not 1 <= clearance <= 4:
                 raise Reject("CLEARANCE_INVALID", f"clearance={clearance!r} outside 1-4")
+            role = claims.get("role")
+            if role is not None and not (isinstance(role, str) and role):
+                raise Reject("ROLE_INVALID", f"role={role!r} is not a role name")
 
             decision, code, detail = check_request(req, claims["scope"], claims["deny"], self.step_up)
-            return Decision(decision, code, agent_id=claims["agent_id"], clearance=clearance, detail=detail, **base)
+            return Decision(decision, code, agent_id=claims["agent_id"], clearance=clearance, role=role,
+                            detail=detail, **base)
         except Reject as r:
             return Decision("DENY", r.code, agent_id=None, detail=r.detail, **base)

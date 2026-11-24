@@ -20,6 +20,8 @@ from gateway.cli import sign_request
 from gateway.lib.common import generate_keypair, pub_to_jwk
 from gateway.lib.gateway_verify import (
     IDENTIFIERS,
+    PRIVATE_LEVEL,
+    PRIVATE_ROLES,
     SMALL_COUNT,
     Gateway,
     Request,
@@ -62,6 +64,7 @@ def load_state(state_dir: Path) -> None:
     # Q6 labels live with the data; the gateway enforces them against results (deny on max)
     load_labels()
     state["small_count"] = small_count_setting()
+    state["private_roles"] = private_roles_setting()
 
 
 def small_count_setting() -> int:
@@ -70,6 +73,15 @@ def small_count_setting() -> int:
         msg = f"GATEWAY_SMALL_COUNT must be at least 1, got {value}"
         raise ValueError(msg)
     return value
+
+
+def private_roles_setting() -> frozenset[str]:
+    raw = os.environ.get("GATEWAY_PRIVATE_ROLES")
+    roles = PRIVATE_ROLES if raw is None else frozenset(filter(None, map(str.strip, raw.split(","))))
+    if not roles:
+        msg = "GATEWAY_PRIVATE_ROLES must name at least one role"
+        raise ValueError(msg)
+    return roles
 
 
 def load_labels() -> None:
@@ -124,6 +136,11 @@ async def describe() -> dict:
             "rule": "aggregate totals and counts are rounded to the nearest multiple of small_count",
             "refused_in_aggregates": sorted(IDENTIFIERS),
         },
+        "private_data": {
+            "level": PRIVATE_LEVEL,
+            "roles": sorted(state["private_roles"]),
+            "rule": "a result at this level needs the clearance and one of these roles in the mandate's role claim",
+        },
         "signing": {
             "alg": "Ed25519 by the key in the mandate's cnf.jwk; sig is base64url without padding",
             "signing_input": "canonical JSON (sorted keys, separators ',' and ':', ensure_ascii=False) of "
@@ -169,10 +186,16 @@ async def tools_call(body: CallBody):
     )
     decision.sensitivity = sensitivity_record(levels, state["level_names"], decision.clearance)
     level = decision.sensitivity["level"]
+    decided_by = ", ".join(decision.sensitivity["decided_by"])
     if decision.clearance is not None and level > decision.clearance:
         decision.decision, decision.reason_code = "DENY", "CLEARANCE_TOO_LOW"
-        decided_by = ", ".join(decision.sensitivity["decided_by"])
         decision.detail = f"result reaches sensitivity {level} above clearance {decision.clearance} ({decided_by})"
+        return JSONResponse({"decision": decision.to_dict()}, status_code=403)
+    if level >= PRIVATE_LEVEL and decision.role not in state["private_roles"]:
+        decision.decision, decision.reason_code = "DENY", "ROLE_REQUIRED"
+        roles = ", ".join(sorted(state["private_roles"]))
+        held = f"the role {decision.role}" if decision.role else "no role"
+        decision.detail = f"result reaches sensitivity {level} ({decided_by}), open to {roles}; the mandate has {held}"
         return JSONResponse({"decision": decision.to_dict()}, status_code=403)
     data = result.data
     if body.tool == "aggregate":

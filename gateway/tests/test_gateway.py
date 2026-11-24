@@ -9,6 +9,8 @@ from gateway.lib.common import priv_from_pem
 from gateway.lib.gateway_verify import Request, check_request
 from mcp_server.api.routes_mcp import SYNTH_ROOT, mcp
 
+ROLE = "safeguarding-lead"  # the role the gateway lists for level 4 by default
+
 
 @pytest.fixture
 def gw(tmp_path, monkeypatch):
@@ -23,6 +25,8 @@ def gw(tmp_path, monkeypatch):
             str(state / "agent.pem"),
             "--clearance",
             "4",
+            "--role",
+            ROLE,
             "-o",
             str(state / "mandate.jwt"),
         ]
@@ -195,6 +199,8 @@ def test_describe_and_issue_to_public_jwk(gw, tmp_path, capsys):
             str(tmp_path / "team.jwk"),
             "--clearance",
             "4",
+            "--role",
+            ROLE,
             "-o",
             str(tmp_path / "m.jwt"),
         ]
@@ -303,10 +309,12 @@ def test_clearance_required_and_denied_on_max(gw, tmp_path):
     assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "CLEARANCE_TOO_LOW")
 
 
-def _issue(state, out, clearance, scope=None):
+def _issue(state, out, clearance, scope=None, role=None):
     argv = ["--state", str(state), "issue", "--agent-key", str(state / "agent.pem"), "--clearance", str(clearance)]
     if scope is not None:
         argv += ["--scope", json.dumps(scope)]
+    if role is not None:
+        argv += ["--role", role]
     cli.main([*argv, "-o", str(out)])
     return out.read_text()
 
@@ -459,7 +467,7 @@ def _aggregate(client, call, agent, mandate, **arguments):
 def test_counts_are_rounded_so_two_answers_cannot_be_subtracted(gw, tmp_path):
     client, call, state = gw
     agent = priv_from_pem((state / "agent.pem").read_bytes())
-    mandate = _issue(state, tmp_path / "counts.jwt", 4, _COUNTS_SCOPE)
+    mandate = _issue(state, tmp_path / "counts.jwt", 4, _COUNTS_SCOPE, ROLE)
 
     def released(**arguments):
         r = _aggregate(client, call, agent, mandate, **arguments)
@@ -516,6 +524,56 @@ def test_an_aggregate_cannot_single_out_a_pupil(gw, tmp_path):
     d = r.json()["decision"]
     assert (r.status_code, d["reason_code"]) == (403, "CLEARANCE_TOO_LOW")
     assert d["sensitivity"]["decided_by"] == ["Ethnicity (filter)"]
+
+
+def test_level_4_needs_a_role_the_gateway_lists(gw, tmp_path, monkeypatch):
+    client, call, state = gw
+    agent = priv_from_pem((state / "agent.pem").read_bytes())
+
+    def read(role):
+        mandate = _issue(state, tmp_path / "pupil.jwt", 4, role=role)
+        args = {"query": ev.PUPIL, "urn": "SCH01"}
+        body = cli.sign_request(agent, server="pupil-data", tool="search", arguments=args, mandate=mandate)
+        return call(client, "search", body=body)[0]
+
+    # census rows carry Ethnicity and InCareAtCurrentSchool at level 4: clearance 4 alone does not open them
+    for role in (None, "teacher"):
+        r = read(role)
+        d = r.json()["decision"]
+        assert (r.status_code, d["reason_code"]) == (403, "ROLE_REQUIRED"), role
+        assert d["sensitivity"]["decided_by"] == ["Ethnicity", "InCareAtCurrentSchool"]
+        assert "result" not in r.json()
+    assert read(ROLE).status_code == 200
+    # below level 4 no role is read: meal counts are level 3
+    mandate = _issue(state, tmp_path / "counts.jwt", 4, _COUNTS_SCOPE)
+    assert _aggregate(client, call, agent, mandate, group_by=["URN"]).status_code == 200
+    assert client.get("/describe").json()["private_data"]["roles"] == [ROLE]
+
+    # the list is the gateway's: replace it, and the roles swap
+    monkeypatch.setitem(main.state, "private_roles", frozenset({"teacher"}))
+    assert read("teacher").status_code == 200
+    assert read(ROLE).json()["decision"]["reason_code"] == "ROLE_REQUIRED"
+    monkeypatch.setenv("GATEWAY_PRIVATE_ROLES", " teacher, dpo ")
+    assert main.private_roles_setting() == {"teacher", "dpo"}
+    monkeypatch.setenv("GATEWAY_PRIVATE_ROLES", " , ")
+    with pytest.raises(ValueError, match="at least one role"):
+        main.private_roles_setting()
+
+    # a role that is not a name refuses every call, even one with no level 4 data
+    token, _ = cli.issue_mandate(
+        state,
+        agent.public_key(),
+        scope=cli.DEFAULT_SCOPE,
+        deny=cli.DEFAULT_DENY,
+        ttl=3600,
+        purpose="bad role",
+        principal="officer:jsmith",
+        org="school:SCH01",
+        extra={"clearance": 4, "role": [ROLE]},
+    )
+    body = cli.sign_request(agent, server="pupil-data", tool="get", arguments={"path": ev.SCHOOLS}, mandate=token)
+    r, _ = call(client, "get", body=body)
+    assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "ROLE_INVALID")
 
 
 def test_eval_set_passes_against_template_gateway(gw, tmp_path):
