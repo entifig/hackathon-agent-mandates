@@ -178,6 +178,7 @@
   .run-top { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-bottom: 4px; }
   .detail { font-size: 12.5px; color: var(--ink-2); margin-top: 6px; }
   .detail.warn-text { color: var(--hold); }
+  .cell { margin-top: 6px; padding: 4px 8px; background: var(--soft); border: 1px solid var(--line); border-radius: 6px; display: inline-block; }
   .notice { font-size: 12.5px; margin-top: 8px; background: var(--info-bg); border-left: 3px solid var(--info); border-radius: 6px; padding: 6px 8px; color: var(--ink-2); }
   .notice b { display: block; color: var(--info); font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 2px; }
   .today { font-size: 13px; color: var(--ink-2); }
@@ -268,13 +269,14 @@
 
 <script>
 const STAGES = [
-  {title: "Issuer", text: "Signs the mandate: scope, deny, clearance, expiry, and a status index.", codes: []},
+  {title: "Issuer", text: "Signs the mandate: scope, deny, clearance, the person's role, expiry, and a status index.", codes: []},
   {title: "Mandate", text: "Accredited issuer, signature, nbf and exp within 30 s, then the status bit.", codes: ["ISSUER_NOT_ACCREDITED", "SIG_INVALID", "NOT_YET_VALID", "EXPIRED", "REVOKED", "STATUS_UNAVAILABLE"]},
   {title: "Proof of possession", text: "Request signed by the key in cnf.jwk, a fresh nonce, time within 300 s.", codes: ["POP_FAILED"]},
-  {title: "Clearance", text: "A level 1 to 4 must be on the mandate. Without one, the person is told which agent asked.", codes: ["CLEARANCE_MISSING", "CLEARANCE_INVALID"]},
-  {title: "Scope", text: "Deny patterns, then any one whole entry. At most 100 rows and no empty search. write and draft are held.", codes: ["DENIED_BY_RULE", "CONSTRAINT_MISSING", "CONSTRAINT_VIOLATED", "OUT_OF_SCOPE", "TOO_MUCH", "STEP_UP"]},
+  {title: "Clearance", text: "A level 1 to 4 must be on the mandate. Without one, the person is told which agent asked. A role, if any, must be a name.", codes: ["CLEARANCE_MISSING", "CLEARANCE_INVALID", "ROLE_INVALID"]},
+  {title: "Scope", text: "Deny patterns, then any one whole entry. At most 100 rows, no empty search, no aggregate by pupil id. write and draft are held.", codes: ["DENIED_BY_RULE", "CONSTRAINT_MISSING", "CONSTRAINT_VIOLATED", "OUT_OF_SCOPE", "TOO_MUCH", "TOO_FINE", "STEP_UP"]},
   {title: "Data server", text: "The call is forwarded. The gateway holds the result before the agent sees it.", codes: []},
-  {title: "Labels", text: "Every key of the result is looked up in the manifest. The highest level decides.", codes: ["CLEARANCE_TOO_LOW", "ALLOW"]},
+  {title: "Labels", text: "Every key and filter of the result is looked up in the manifest. The highest level decides. Level 4 also needs a role the gateway lists.", codes: ["CLEARANCE_TOO_LOW", "ROLE_REQUIRED", "ALLOW"]},
+  {title: "Rounding", text: "Aggregate totals and counts leave rounded to the nearest 10, so no count below 10 is released as itself.", codes: []},
 ];
 const STATE_NAME = {solved: "Solved", answered: "Answered", open: "Open"};
 const ICON = {pass: "✓", fail: "✕", hold: "Ⅱ", allow: "✓", unread: "·"};
@@ -345,7 +347,7 @@ function renderChips() {
     `<span class="chip">${dot((h.mcp || {}).up)}<b>Pupil data</b>${esc((h.mcp || {}).url || "")}</span>`,
     `<span class="chip">${dot((h.gateway || {}).up)}<b>Gateway</b>${esc((h.gateway || {}).url || "")}</span>`,
   ];
-  if (local) chips.push(`<span class="chip"><b>Local mandate</b>clearance ${esc(show(local.clearance))} · expires ${fromNow(local.exp)}</span>`);
+  if (local) chips.push(`<span class="chip"><b>Local mandate</b>clearance ${esc(show(local.clearance))}${local.role ? ` · ${esc(local.role)}` : ""} · expires ${fromNow(local.exp)}</span>`);
   if (pack) chips.push(`<span class="chip"><b>Eval pack</b>expires ${fromNow(pack.exp)}</span>`);
   if (data.labels && data.labels.path) chips.push(`<span class="chip"><b>Labels</b>${esc(data.labels.path)}</span>`);
   $("chips").innerHTML = chips.join("");
@@ -454,7 +456,9 @@ function runCell(c) {
   const rows = c.count == null ? "" : ` · ${c.count} row${c.count === 1 ? "" : "s"}`;
   const notes = [];
   if (c.detail) notes.push(`<div class="detail">${esc(c.detail)}</div>`);
-  if (c.smallest_group != null) notes.push(`<div class="detail ${c.smallest_group < 10 ? "warn-text" : ""}">Smallest group: <b>${esc(c.smallest_group)}</b> pupil${c.smallest_group === 1 ? "" : "s"}. Counts are exact, with no minimum cell size.</div>`);
+  if (c.rounded === true) notes.push(`<div class="detail">Rounded by the gateway to the nearest ${esc(c.rounded_to)}. Counts released: <b>${esc((c.count_values || []).join(", "))}</b>.</div>`);
+  if (c.rounded === false) notes.push(`<div class="detail warn-text">Exact counts: the gateway did not round this answer.</div>`);
+  for (const cell of c.cells || []) notes.push(`<div class="cell mono small">${Object.entries(cell).map(([k, v]) => `${esc(k)} <b>${esc(v)}</b>`).join(" · ")}</div>`);
   if (c.notice) notes.push(`<div class="notice"><b>Notice for the person</b>${esc(c.notice)}</div>`);
   if (c.ignored_claim) notes.push(`<div class="detail">Signed and unread: purpose “${esc(c.ignored_claim.purpose)}”, principal <code>${esc(c.ignored_claim.principal)}</code>.</div>`);
   if (c.audit_file != null) notes.push(`<div class="detail">Audit file in gateway/state: <b>${c.audit_file ? "yes" : "none"}</b>.</div>`);
@@ -547,9 +551,10 @@ function grants(scope) {
 function renderMandates(rows) {
   const box = $("mandates");
   if (!rows.length) { box.innerHTML = `<p class="err">No mandates found.</p>`; return; }
-  box.innerHTML = `<div class="scroll-x"><table><thead><tr><th>Mandate</th><th>Clearance</th><th>Grants</th><th>Expires</th></tr></thead><tbody>${rows.map((m) => `
+  box.innerHTML = `<div class="scroll-x"><table><thead><tr><th>Mandate</th><th>Clearance</th><th>Role</th><th>Grants</th><th>Expires</th></tr></thead><tbody>${rows.map((m) => `
     <tr><td><b>${esc(m.label)}</b><div class="mono muted file">${esc(m.file)} · idx ${esc(show(m.idx))}</div></td>
     <td>${clearanceTag(m.clearance)}</td>
+    <td>${m.role ? `<code>${esc(m.role)}</code>` : `<span class="muted small">none</span>`}</td>
     <td>${grants(m.scope)}<div class="grant c">deny ${esc((m.deny || []).join(", ") || "none")}</div></td>
     <td class="small">${fromNow(m.exp)}</td></tr>`).join("")}</tbody></table></div>`;
 }

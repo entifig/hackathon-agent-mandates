@@ -180,7 +180,7 @@ def cmd_issue(a) -> None:
         purpose=a.purpose,
         principal=a.principal,
         org=a.org,
-        extra={"clearance": a.clearance, **json.loads(a.claims)},
+        extra={"clearance": a.clearance, **({"role": a.role} if a.role else {}), **json.loads(a.claims)},
     )
     if a.out:
         a.out.write_text(token)
@@ -264,6 +264,10 @@ def main(argv: list[str] | None = None) -> None:
         choices=[1, 2, 3, 4],
         required=True,
         help="PII level the agent may receive: 1 public to 4 special category (required)",
+    )
+    s.add_argument(
+        "--role",
+        help="a role the person holds, signed in for the agent; level 4 also needs a role the gateway lists",
     )
     s.add_argument("--scope", default=json.dumps(DEFAULT_SCOPE), help="what the agent may do (JSON)")
     s.add_argument("--deny", default=json.dumps(DEFAULT_DENY), help="what it must never do (JSON)")
