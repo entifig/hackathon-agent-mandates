@@ -7,7 +7,7 @@ export
 install:
 	cd frontend && npm install
 	uv sync --extra fastapi --extra gateway --extra synth
-	docker compose build 
+	docker compose --profile tools build
 
 .PHONY: synth
 synth:  ## Regenerate mcp_server/data/synthetic (pupil census, deprivation, schools, display names) from mcp_server/synth/synth.yaml
@@ -18,12 +18,12 @@ hack: install  ## One command start: keys, one-school mandate, eval pack, contai
 	test -f gateway/state/trusted_list.json || uv run python -m gateway.cli init
 	uv run python -m gateway.cli issue --agent-key gateway/state/agent.pem --clearance 4 --role safeguarding-lead -o gateway/state/mandate.jwt
 	uv run python -m gateway.eval build -o eval_pack
-	docker compose up -d --wait
+	docker compose --profile tools up -d --wait
 	uv run python -m gateway.cli call --mandate gateway/state/mandate.jwt --agent-key gateway/state/agent.pem \
 		--tool search --args '{"query": "P0004", "urn": "SCH01"}'
 
 run:
-	docker compose up -d --wait
+	docker compose --profile tools up -d --wait
 
 stop:
 	docker compose down
@@ -53,6 +53,16 @@ attack_mandates:  ## Day 2: issue the default mandate, and a feature mandate if 
 				$(if $(FEATURE_SCOPE),--scope "$$(cat $(FEATURE_SCOPE))") $(if $(FEATURE_CLAIMS),--claims "$$(cat $(FEATURE_CLAIMS))"); \
 		fi; \
 	done
+
+attack_lab: install  ## Day 2: start gateway, backend and the loopback-only attack board, then open http://127.0.0.1:8090/attack
+	cp -n .env.example .env || true
+	test -f gateway/state/trusted_list.json || uv run python -m gateway.cli init
+	test -f gateway/state/mandate.jwt || uv run python -m gateway.cli issue --agent-key gateway/state/agent.pem --clearance 4 --role safeguarding-lead -o gateway/state/mandate.jwt
+	docker compose --profile tools up -d --wait
+	@echo "attack lab  http://127.0.0.1:8090/attack  (loopback only — it mints with our issuer key, so never expose this port)"
+
+attack_scan:  ## Day 2: headless scan — fire every runnable vector and score it. TARGET=own (default) or a day_2_attack/targets/<team> folder; own uses GATEWAY_URL
+	uv run --extra gateway python local_view/attacks.py --target $${TARGET:-own} --url $${GATEWAY_URL:-http://localhost:8082}
 
 test:
 	cd mcp_server && uv sync --group dev --extra fastapi --extra synth && uv run python -m pytest --cov=mcp_server -v --cov-report=term-missing --cov-fail-under=0

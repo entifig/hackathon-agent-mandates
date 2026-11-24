@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mandate gateway · attack lab</title>
+<style>
+  :root {
+    --bg: #f3f1ec;
+    --card: #ffffff;
+    --ink: #17181c;
+    --ink-2: #3f424b;
+    --muted: #6b6e78;
+    --line: #e2dfd7;
+    --soft: #f7f5f1;
+    --top: #15171c;
+    --top-ink: #f3f1ec;
+    --top-muted: #a5a8b2;
+    --allow: #19764a; --allow-bg: #e2f2e9;
+    --deny: #b42318; --deny-bg: #fde7e4;
+    --hold: #9a5a06; --hold-bg: #fcefd6;
+    --info: #2d5cae; --info-bg: #e7eefa;
+    --l1: #2d6a44; --l1-bg: #e3f0e7;
+    --l2: #285393; --l2-bg: #e2ebf8;
+    --l3: #875000; --l3-bg: #fbecd0;
+    --l4: #9a1b1b; --l4-bg: #fadcd8;
+    --radius: 14px;
+    --shadow: 0 1px 2px rgba(20, 20, 30, .04), 0 6px 18px rgba(20, 20, 30, .05);
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif; }
+  .wrap { max-width: 1320px; margin: 0 auto; padding: 0 24px; }
+  code, .mono { font-family: var(--mono); font-size: 12.5px; }
+  h2 { font-size: 13px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 0; font-weight: 650; }
+  h4 { margin: 0 0 4px; font-size: 12px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); font-weight: 650; }
+  p { margin: 0; }
+  .muted { color: var(--muted); }
+  .small { font-size: 12.5px; }
+  .err { color: var(--deny); background: var(--deny-bg); border-radius: 8px; padding: 8px 12px; margin: 10px 0; }
+
+  /* header */
+  .top { background: var(--top); color: var(--top-ink); padding: 26px 0 18px; }
+  .top .wrap { display: grid; gap: 16px; }
+  .brand { display: flex; gap: 16px; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; }
+  .brand h1 { margin: 0; font-size: 26px; letter-spacing: -.02em; font-weight: 650; }
+  .brand p { color: var(--top-muted); max-width: 70ch; margin-top: 4px; }
+  .brand a { color: var(--top-ink); }
+  .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  button { font: inherit; cursor: pointer; border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--ink); padding: 7px 14px; }
+  button:hover { border-color: var(--ink-2); }
+  button:disabled { opacity: .6; cursor: not-allowed; }
+  .top button { background: transparent; color: var(--top-ink); border-color: #3a3d46; }
+  .top button:hover { border-color: var(--top-ink); }
+  .top button.primary { background: var(--top-ink); color: var(--top); border-color: var(--top-ink); font-weight: 600; }
+  .top select, .top input { font: inherit; background: #21242b; color: var(--top-ink); border: 1px solid #3a3d46; border-radius: 10px; padding: 7px 10px; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip { display: inline-flex; gap: 8px; align-items: center; border: 1px solid #30333b; border-radius: 999px; padding: 4px 12px; font-size: 13px; color: var(--top-muted); }
+  .chip b { color: var(--top-ink); font-weight: 600; }
+  .chip.score-bad b { color: #ff9a8f; }
+  .chip.score-ok b { color: #3ccf86; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--top-muted); }
+  .dot.on { background: #3ccf86; box-shadow: 0 0 0 3px rgba(60, 207, 134, .18); }
+  .dot.off { background: #ff6b5e; box-shadow: 0 0 0 3px rgba(255, 107, 94, .18); }
+
+  main.wrap { display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; padding-top: 20px; padding-bottom: 48px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); padding: 18px 20px; }
+  .card-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+  .row-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: 12px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); font-weight: 650; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+  td { vertical-align: top; padding: 10px; border-bottom: 1px solid var(--line); }
+  tr:last-child td { border-bottom: 0; }
+  table.findings { background: var(--card); border: 1px solid var(--line); border-radius: 10px; border-collapse: separate; border-spacing: 0; overflow: hidden; }
+  .scroll-x { overflow-x: auto; }
+
+  .args { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+  .arg { font-family: var(--mono); font-size: 12px; background: var(--soft); border: 1px solid var(--line); border-radius: 6px; padding: 0 6px; word-break: break-all; }
+  .arg .k { color: var(--muted); margin-right: 4px; }
+  .arg .k::after { content: "="; }
+
+  .lv { display: inline-flex; align-items: center; gap: 5px; border-radius: 999px; padding: 1px 8px 1px 2px; font-size: 12px; white-space: nowrap; margin: 0 4px 4px 0; }
+  .lv .n { width: 17px; height: 17px; border-radius: 50%; display: grid; place-items: center; font-size: 11px; font-weight: 700; color: #fff; }
+  .lv.l0 { background: var(--soft); color: var(--muted); } .lv.l0 .n { background: var(--muted); }
+  .lv.l1 { background: var(--l1-bg); color: var(--l1); } .lv.l1 .n { background: var(--l1); }
+  .lv.l2 { background: var(--l2-bg); color: var(--l2); } .lv.l2 .n { background: var(--l2); }
+  .lv.l3 { background: var(--l3-bg); color: var(--l3); } .lv.l3 .n { background: var(--l3); }
+  .lv.l4 { background: var(--l4-bg); color: var(--l4); } .lv.l4 .n { background: var(--l4); }
+  .lv.none { background: var(--deny-bg); color: var(--deny); padding: 1px 8px; font-weight: 600; }
+  .lv.strong { font-weight: 700; outline: 1.5px solid currentColor; }
+
+  .badge { display: inline-block; font-weight: 700; font-size: 12px; letter-spacing: .03em; border-radius: 6px; padding: 2px 8px; background: var(--soft); color: var(--ink-2); }
+  .badge.ALLOW { background: var(--allow); color: #fff; }
+  .badge.DENY { background: var(--deny); color: #fff; }
+  .badge.STEP_UP { background: var(--hold); color: #fff; }
+  .badge.LEAK { background: var(--deny); color: #fff; }
+
+  /* outcome pills: red = needs attention, green = held/safe, amber = odd, grey = neutral */
+  .out { display: inline-block; font-weight: 700; font-size: 12px; border-radius: 6px; padding: 2px 9px; white-space: nowrap; }
+  .out.bad { background: var(--deny-bg); color: var(--deny); outline: 1px solid #f2b8b2; }
+  .out.ok { background: var(--allow-bg); color: var(--allow); }
+  .out.warn { background: var(--hold-bg); color: var(--hold); }
+  .out.flat { background: var(--soft); color: var(--ink-2); }
+
+  .break { display: inline-block; font-family: var(--mono); font-size: 11.5px; background: var(--deny-bg); color: var(--deny); border-radius: 6px; padding: 0 6px; margin: 0 4px 3px 0; }
+  .pts { font-family: var(--mono); font-weight: 700; }
+  .pts.zero { color: var(--muted); font-weight: 400; }
+  .flag { display: inline-block; font-size: 11.5px; background: var(--l4-bg); color: var(--l4); border-radius: 6px; padding: 0 6px; margin: 2px 4px 0 0; }
+  .detail { font-size: 12.5px; color: var(--ink-2); margin-top: 6px; }
+  .note { font-size: 12px; color: var(--muted); margin-top: 3px; }
+
+  /* vectors */
+  .vgroup { border: 1px solid var(--line); border-radius: 12px; margin-bottom: 10px; overflow: hidden; }
+  .vgroup-head { display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: var(--soft); border-bottom: 1px solid var(--line); }
+  .vgroup-head h4 { margin: 0; color: var(--ink-2); }
+  .vgroup-head .count { font-size: 12px; color: var(--muted); }
+  .vrow { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+  .vrow:last-child { border-bottom: 0; }
+  .vrow.muted-row { opacity: .5; }
+  .vrow .vmain { flex: 1; min-width: 0; }
+  .vrow .vtitle { font-weight: 600; }
+  .vrow .vid { font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+  .vrow .vlast { flex: none; }
+  .tag { display: inline-block; font-size: 11.5px; border-radius: 999px; padding: 0 8px; border: 1px solid var(--line); color: var(--ink-2); margin: 0 4px 0 0; }
+  .tag.mint { color: var(--info); border-color: #bcd0f2; background: var(--info-bg); }
+  .tag.brk { color: var(--deny); border-color: #f2b8b2; background: var(--deny-bg); }
+
+  /* composer */
+  .compose { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 18px; }
+  .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 14px; }
+  .field { display: grid; gap: 3px; }
+  .field.wide { grid-column: 1 / -1; }
+  .field label { font-size: 12px; color: var(--muted); font-weight: 600; }
+  .field input, .field select, .field textarea { font: inherit; border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; background: var(--card); color: var(--ink); width: 100%; }
+  .field textarea { font-family: var(--mono); font-size: 12px; resize: vertical; min-height: 44px; }
+  .field .hint { font-size: 11px; color: var(--muted); }
+  fieldset { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; margin: 0 0 12px; }
+  legend { font-size: 12px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); font-weight: 650; padding: 0 6px; }
+  .check { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+  .check input { width: auto; }
+  pre.spec { background: var(--soft); border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-family: var(--mono); font-size: 12px; overflow-x: auto; margin: 0; max-height: 320px; }
+  .kv th { width: 120px; text-transform: none; letter-spacing: 0; font-size: 13px; padding: 8px 10px 8px 0; border-bottom: 1px solid var(--line); vertical-align: top; color: var(--ink-2); }
+  .kv td { padding: 8px 0; word-break: break-all; }
+  .result-box { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; background: #fcfbf9; }
+
+  @media (max-width: 1100px) {
+    .compose, .form-grid { grid-template-columns: minmax(0, 1fr); }
+    table.findings, table.findings tbody, table.findings tr, table.findings td { display: block; width: 100%; }
+    table.findings thead { display: none; }
+    table.findings tr { border-bottom: 1px solid var(--line); }
+    table.findings td { border: 0; padding: 6px 12px; }
+    table.findings td::before { content: attr(data-label); display: block; font-size: 11px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); margin-bottom: 2px; }
+  }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <div class="brand">
+      <div>
+        <h1>Mandate gateway · attack lab</h1>
+        <p>Fires adversarial requests at a gateway and scores each result against the Day 2 rules. <a href="/">Back to the board</a>.</p>
+      </div>
+      <div class="actions">
+        <label class="small" for="target" style="color:var(--top-muted)">Target</label>
+        <select id="target"></select>
+        <input id="url" type="text" placeholder="gateway URL" size="26" hidden>
+        <button type="button" id="reload">Reload vectors</button>
+        <button type="button" class="primary" id="run-all">Run every vector</button>
+      </div>
+    </div>
+    <div class="chips" id="chips"><span class="chip">Loading…</span></div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="card">
+    <div class="card-head">
+      <h2>Findings</h2>
+      <div class="row-actions">
+        <span class="muted small" id="findings-note">Run a vector to add a row.</span>
+        <button type="button" id="export">Export JSON</button>
+        <button type="button" id="clear">Clear</button>
+      </div>
+    </div>
+    <div class="scroll-x">
+      <table class="findings">
+        <thead><tr><th>Vector</th><th>Mandate</th><th>Request</th><th>Outcome</th><th>Level</th><th>Points</th><th>Detail</th></tr></thead>
+        <tbody id="findings"><tr><td colspan="7" class="muted">No findings yet.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>Vectors</h2>
+      <span class="muted small" id="vectors-note">Each vector mints or forges a mandate, calls a tool, and scores the answer.</span>
+    </div>
+    <div id="vectors"><p class="muted">Loading the catalog…</p></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>Compose an attack</h2>
+      <span class="muted small">Every lever the engine exposes. The spec on the right is exactly what is sent.</span>
+    </div>
+    <div class="compose">
+      <form id="composer" autocomplete="off">
+        <fieldset>
+          <legend>Mandate</legend>
+          <div class="form-grid">
+            <div class="field">
+              <label for="c-source">Source</label>
+              <select id="c-source">
+                <option value="base">Base (on disk / minted)</option>
+                <option value="mint">Mint fresh (own only)</option>
+                <option value="raw">Raw token string</option>
+              </select>
+            </div>
+            <div class="field" id="c-base-wrap">
+              <label for="c-base">Base mandate</label>
+              <select id="c-base">
+                <option value="default">default</option>
+                <option value="feature">feature (aggregate)</option>
+                <option value="live">live (gateway/state)</option>
+              </select>
+            </div>
+            <div class="field wide" id="c-raw-wrap" hidden>
+              <label for="c-raw">Raw mandate (JWT string)</label>
+              <textarea id="c-raw" rows="2" placeholder="eyJ..."></textarea>
+            </div>
+            <div class="field"><label for="c-clearance">Clearance</label><input id="c-clearance" type="text" placeholder="unchanged"></div>
+            <div class="field"><label for="c-role">Role</label><input id="c-role" type="text" placeholder="unchanged"></div>
+            <div class="field wide" id="c-mint-extra" hidden>
+              <label for="c-scope-urn">Mint scope — school URN · tools (comma)</label>
+              <div class="form-grid">
+                <input id="c-scope-urn" type="text" placeholder="SCH04">
+                <input id="c-scope-tools" type="text" placeholder="pupil, search">
+              </div>
+              <div class="form-grid" style="margin-top:6px">
+                <input id="c-deny" type="text" placeholder="deny: *.write, pii.*">
+                <input id="c-ttl" type="text" placeholder="ttl seconds (3600)">
+              </div>
+            </div>
+          </div>
+        </fieldset>
+        <fieldset>
+          <legend>Forge / tamper</legend>
+          <div class="form-grid">
+            <div class="field">
+              <label for="c-forge">Forge op</label>
+              <select id="c-forge">
+                <option value="">none</option>
+                <option value="keep-sig">keep-sig (edit, reuse signature)</option>
+                <option value="none">alg none (unsigned)</option>
+                <option value="swap-cnf">swap-cnf (rebind to our key)</option>
+                <option value="random-issuer">random issuer (untrusted re-sign)</option>
+                <option value="issuer">issuer re-sign (own only)</option>
+                <option value="hs256">hs256 confusion (own only)</option>
+              </select>
+            </div>
+            <div class="field"><label for="c-typ">Header typ</label><input id="c-typ" type="text" placeholder="unchanged (e.g. JWT)"></div>
+            <div class="field wide"><label for="c-set">Set claims (JSON)</label><textarea id="c-set" rows="2" placeholder='{"clearance": 9}'></textarea></div>
+            <div class="field wide"><label for="c-del">Delete claims (comma)</label><input id="c-del" type="text" placeholder="iss, status, cnf"></div>
+            <div class="field"><label class="check"><input id="c-revoke" type="checkbox"> revoke after mint (own only)</label></div>
+          </div>
+        </fieldset>
+        <fieldset>
+          <legend>Request</legend>
+          <div class="form-grid">
+            <div class="field">
+              <label for="c-tool">Tool</label>
+              <select id="c-tool">
+                <option>search</option><option>get</option><option>aggregate</option>
+                <option>classification</option><option>roster</option><option>pupil</option>
+                <option>draft</option><option>write</option>
+              </select>
+            </div>
+            <div class="field"><label for="c-repeat">Repeat</label><input id="c-repeat" type="text" placeholder="1"></div>
+            <div class="field wide"><label for="c-args">Arguments (JSON)</label><textarea id="c-args" rows="2">{}</textarea></div>
+          </div>
+        </fieldset>
+        <fieldset>
+          <legend>Proof of possession</legend>
+          <div class="form-grid">
+            <div class="field">
+              <label for="c-sig">Signature</label>
+              <select id="c-sig">
+                <option value="valid">valid</option>
+                <option value="blank">blank</option>
+                <option value="garbage">garbage</option>
+                <option value="wrong-key">wrong key</option>
+              </select>
+            </div>
+            <div class="field"><label for="c-ts">ts offset (s)</label><input id="c-ts" type="text" placeholder="0"></div>
+            <div class="field"><label for="c-nonce">Nonce</label><input id="c-nonce" type="text" placeholder="fresh"></div>
+            <div class="field"><label class="check"><input id="c-replay" type="checkbox"> replay (send twice, same nonce)</label></div>
+            <div class="field wide"><label for="c-mutate">Mutate arguments after signing (JSON)</label><textarea id="c-mutate" rows="2" placeholder='{"limit": 500}'></textarea></div>
+          </div>
+        </fieldset>
+        <div class="row-actions">
+          <button type="button" class="primary" id="c-run">Run</button>
+          <button type="button" id="c-save">Save as vector</button>
+          <span class="muted small" id="c-status"></span>
+        </div>
+      </form>
+      <div>
+        <h4>Spec sent</h4>
+        <pre class="spec" id="spec">{}</pre>
+        <div id="c-result" style="margin-top:14px"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+const GROUP_ORDER = ["baseline", "data", "aggregate", "forged", "dead", "nokey", "bulk", "crash", "keys", "manual", "saved"];
+const GROUP_NAME = {
+  baseline: "Baseline — should be allowed",
+  data: "Data disclosure",
+  aggregate: "Aggregate leakage",
+  forged: "Forged mandates",
+  dead: "Dead mandates",
+  nokey: "No / bad key",
+  bulk: "Bulk export",
+  crash: "Crash the gateway",
+  keys: "Key discovery",
+  manual: "Manual",
+  saved: "Saved",
+};
+const OUTCOME = {
+  LANDED: "bad", BROKE: "bad", "OVER-DENY": "warn", DATA: "bad",
+  DENIED: "ok", HELD: "ok", OK: "ok", RAN: "flat", "NO ANSWER": "flat", ERROR: "warn",
+};
+const TOOL_ARGS = {
+  search: {urn: "SCH04", query: "Okafor"},
+  get: {path: "data/personal_data_school_census.csv"},
+  aggregate: {urn: "SCH07", measure: "count", group_by: "InCareAtCurrentSchool"},
+  classification: {},
+  roster: {urn: "SCH04", pupil_id: "P0011"},
+  pupil: {pupil_id: "P0011", urn: "SCH04"},
+  draft: {pupil_id: "P0011", urn: "SCH04"},
+  write: {urn: "SCH04", pupil_id: "P0011", field: "Notes", value: "x"},
+};
+
+const state = {targets: [], vectors: [], findings: [], target: null};
+
+const $ = (id) => document.getElementById(id);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const show = (v) => (v == null ? "—" : typeof v === "string" ? v : JSON.stringify(v));
+
+async function getJson(url, options = {}) {
+  try {
+    const res = await fetch(url, options);
+    const body = await res.json();
+    if (!res.ok && body && !body.error) body.error = `HTTP ${res.status}`;
+    return body;
+  } catch (err) {
+    return {error: String(err)};
+  }
+}
+
+function post(path, payload) {
+  return getJson(path, {method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify(payload)});
+}
+
+function lv(level, text, strong = false) {
+  const n = level == null ? 0 : level;
+  return `<span class="lv l${n}${strong ? " strong" : ""}"><span class="n">${n}</span>${esc(text)}</span>`;
+}
+
+function clearanceTag(level) {
+  return level == null ? `<span class="lv none">no clearance</span>` : lv(level, `clearance ${level}`);
+}
+
+function currentTarget() {
+  return state.targets.find((t) => t.id === $("target").value) || null;
+}
+
+function isByo() {
+  const t = currentTarget();
+  return t ? t.mode === "byo" : false;
+}
+
+/* ---------------------------------------------------------------- header + score */
+
+function renderChips() {
+  const t = currentTarget();
+  const fs = state.findings;
+  const points = fs.reduce((a, f) => a + (f.points || 0), 0);
+  const landed = fs.filter((f) => f.outcome === "LANDED" || f.outcome === "BROKE" || f.outcome === "OVER-DENY").length;
+  const breaks = {};
+  for (const f of fs) for (const [k, v] of Object.entries(f.breaks || {})) breaks[k] = (breaks[k] || 0) + v;
+  const brkText = Object.keys(breaks).length ? Object.entries(breaks).map(([k, v]) => `${k} ${v}`).join(" · ") : "none";
+  const chips = [
+    `<span class="chip"><b>Target</b>${esc(t ? t.label : "—")}</span>`,
+    `<span class="chip"><b>Mode</b>${esc(t ? t.mode : "—")}${t && t.mode === "byo" ? ` · ${esc(t.url || "no url")}` : ""}</span>`,
+    `<span class="chip ${points ? "score-bad" : ""}"><b>Points scored</b>${points}</span>`,
+    `<span class="chip ${landed ? "score-bad" : "score-ok"}"><b>Need attention</b>${landed} of ${fs.length}</span>`,
+    `<span class="chip"><b>Breaks</b>${esc(brkText)}</span>`,
+  ];
+  $("chips").innerHTML = chips.join("");
+}
+
+/* ---------------------------------------------------------------- findings */
+
+function mandateCell(f) {
+  const m = f.mandate_claims || {};
+  const scope = (m.scope || []).map((e) => (e.tools || []).join("/")).join(", ");
+  const bits = [];
+  bits.push(clearanceTag(m.clearance));
+  if (m.role) bits.push(`<code>${esc(m.role)}</code>`);
+  const sub = [];
+  if (m.iss) sub.push(`iss ${esc(String(m.iss).split(":").pop())}`);
+  if (m.idx != null) sub.push(`idx ${esc(m.idx)}`);
+  if (scope) sub.push(esc(scope));
+  return `<div>${bits.join(" ")}</div><div class="mono muted small">${sub.join(" · ") || "—"}</div>`;
+}
+
+function requestCell(f) {
+  const r = f.request || {};
+  if (r.GET) return `<code>GET ${esc(r.GET)}</code>`;
+  if (r.demo_call) return `<div class="mono small">demo mint</div><code>${esc((r.demo_call || {}).tool || "")}</code>`;
+  const args = Object.entries(r.arguments || {}).map(([k, v]) => `<span class="arg"><span class="k">${esc(k)}</span>${esc(show(v))}</span>`).join("");
+  return `<div><code>${esc(r.server || "pupil-data")}.${esc(r.tool || f.type)}</code></div><div class="args">${args}</div>`;
+}
+
+function pointsCell(f) {
+  const breaks = Object.entries(f.breaks || {}).map(([k, v]) => `<span class="break">${esc(k)} +${v}</span>`).join("");
+  const dataPts = (f.points || 0) - Object.values(f.breaks || {}).reduce((a, v) => a + v, 0);
+  const cls = f.points ? "" : " zero";
+  return `<div class="pts${cls}">${f.points || 0}</div>${dataPts > 0 ? `<div class="note">data ${dataPts}</div>` : ""}${breaks}`;
+}
+
+function detailCell(f) {
+  const out = [];
+  if (f.error) out.push(`<div class="err small">${esc(f.error)}</div>`);
+  if (f.got || f.reason) out.push(`<div class="mono small"><span class="badge ${esc(f.got || "")}">${esc(f.got || "?")}</span> ${esc(f.reason || "")}${f.status != null ? ` · HTTP ${esc(f.status)}` : ""}</div>`);
+  if (f.detail) out.push(`<div class="detail">${esc(f.detail)}</div>`);
+  for (const fl of f.flags || []) out.push(`<span class="flag">${esc(fl.id)} ${esc(fl.detail || "")} (+${fl.points})</span>`);
+  if (f.distinct_pupils > 0) out.push(`<div class="note">${f.distinct_pupils} distinct pupils${f.rows != null ? `, ${f.rows} rows` : ""}</div>`);
+  for (const n of f.notes || []) out.push(`<div class="note">${esc(n)}</div>`);
+  if (f.note) out.push(`<div class="note">${esc(f.note)}</div>`);
+  return out.join("") || `<span class="muted">—</span>`;
+}
+
+function findingRow(f) {
+  const cls = OUTCOME[f.outcome] || "flat";
+  return `<tr>
+    <td data-label="Vector"><div class="vtitle">${esc(f.title || f.id)}</div><div class="vid">${esc(f.group)} · ${esc(f.id)}</div></td>
+    <td data-label="Mandate">${mandateCell(f)}</td>
+    <td data-label="Request">${requestCell(f)}</td>
+    <td data-label="Outcome"><span class="out ${cls}">${esc(f.outcome)}</span></td>
+    <td data-label="Level">${f.level ? lv(f.level, f.label || "") : `<span class="muted">—</span>`}</td>
+    <td data-label="Points">${pointsCell(f)}</td>
+    <td data-label="Detail">${detailCell(f)}</td>
+  </tr>`;
+}
+
+function renderFindings() {
+  const fs = state.findings;
+  $("findings").innerHTML = fs.length ? fs.map(findingRow).join("") : `<tr><td colspan="7" class="muted">No findings yet.</td></tr>`;
+  const landed = fs.filter((f) => OUTCOME[f.outcome] === "bad").length;
+  $("findings-note").textContent = fs.length ? `${fs.length} findings · ${landed} needing attention` : "Run a vector to add a row.";
+  renderChips();
+  renderVectors();
+}
+
+function addFindings(rows, scope) {
+  const ids = new Set(rows.map((r) => r.id));
+  if (scope === "all") state.findings = rows;
+  else if (scope === "group") state.findings = state.findings.filter((f) => !ids.has(f.id)).concat(rows);
+  else state.findings = state.findings.filter((f) => !ids.has(f.id)).concat(rows);
+  renderFindings();
+}
+
+/* ---------------------------------------------------------------- vectors */
+
+function lastOutcome(id) {
+  const f = [...state.findings].reverse().find((x) => x.id === id);
+  if (!f) return "";
+  return `<span class="out ${OUTCOME[f.outcome] || "flat"}">${esc(f.outcome)}</span> <span class="pts small">${f.points || 0}</span>`;
+}
+
+function renderVectors() {
+  const byo = isByo();
+  const groups = {};
+  for (const v of state.vectors) (groups[v.group] = groups[v.group] || []).push(v);
+  const order = GROUP_ORDER.filter((g) => groups[g]).concat(Object.keys(groups).filter((g) => !GROUP_ORDER.includes(g)));
+  $("vectors").innerHTML = order.map((g) => {
+    const rows = groups[g].map((v) => {
+      const blocked = byo && v.needs_mint;
+      const tags = [];
+      if (v.needs_mint) tags.push(`<span class="tag mint">mint</span>`);
+      if (v.break) tags.push(`<span class="tag brk">${esc(v.break)}</span>`);
+      return `<div class="vrow${blocked ? " muted-row" : ""}">
+        <div class="vmain">
+          <div class="vtitle">${esc(v.title)} ${tags.join("")}</div>
+          <div class="vid">${esc(v.id)}</div>
+          ${v.note ? `<div class="note">${esc(v.note)}</div>` : ""}
+        </div>
+        <div class="vlast">${lastOutcome(v.id)}</div>
+        <button type="button" data-run="${esc(v.id)}"${blocked ? " disabled title='needs our issuer key — own target only'" : ""}>Run</button>
+      </div>`;
+    }).join("");
+    return `<div class="vgroup">
+      <div class="vgroup-head">
+        <h4>${esc(GROUP_NAME[g] || g)}</h4>
+        <span class="count">${groups[g].length}</span>
+        <button type="button" data-group="${esc(g)}" style="margin-left:auto">Run group</button>
+      </div>
+      ${rows}
+    </div>`;
+  }).join("");
+}
+
+/* ---------------------------------------------------------------- running */
+
+function targetPayload(extra) {
+  const t = currentTarget();
+  const body = {target: t ? t.id : "own", ...extra};
+  if (t && t.mode === "byo") body.url = $("url").value || t.url || "";
+  return body;
+}
+
+async function runVector(id, button) {
+  if (button) { button.disabled = true; button.textContent = "…"; }
+  const f = await post("/api/attack/run", targetPayload({vector_id: id}));
+  if (button) { button.disabled = false; button.textContent = "Run"; }
+  if (f && f.id) addFindings([f], "one");
+  else alert((f && f.error) || "run failed");
+}
+
+async function runGroup(group, button) {
+  if (button) { button.disabled = true; button.textContent = "…"; }
+  const body = await post("/api/attack/run-all", targetPayload({group}));
+  if (button) { button.disabled = false; button.textContent = "Run group"; }
+  if (body && body.findings) addFindings(body.findings, "group");
+  else alert((body && body.error) || "run failed");
+}
+
+async function runAll() {
+  const button = $("run-all");
+  button.disabled = true;
+  button.textContent = "Running…";
+  const body = await post("/api/attack/run-all", targetPayload({}));
+  button.disabled = false;
+  button.textContent = "Run every vector";
+  if (body && body.findings) addFindings(body.findings, "all");
+  else alert((body && body.error) || "run failed");
+}
+
+/* ---------------------------------------------------------------- composer */
+
+function parseJson(raw, fallback) {
+  const text = (raw || "").trim();
+  if (!text) return fallback;
+  try { return JSON.parse(text); } catch { return undefined; }
+}
+
+function buildSpec() {
+  const source = $("c-source").value;
+  const mandate = {};
+  if (source === "raw") {
+    mandate.raw = $("c-raw").value.trim();
+  } else if (source === "mint") {
+    const mint = {};
+    const urn = $("c-scope-urn").value.trim();
+    const tools = $("c-scope-tools").value.split(",").map((s) => s.trim()).filter(Boolean);
+    if (urn || tools.length) {
+      mint.scope = [{server: "pupil-data", tools: tools.length ? tools : ["search"], constraints: urn ? {urn: [urn]} : {}}];
+    }
+    const deny = $("c-deny").value.split(",").map((s) => s.trim()).filter(Boolean);
+    if (deny.length) mint.deny = deny;
+    const ttl = $("c-ttl").value.trim();
+    if (ttl) mint.ttl = Number(ttl);
+    const cl = $("c-clearance").value.trim();
+    if (cl) mint.clearance = isNaN(Number(cl)) ? cl : Number(cl);
+    const role = $("c-role").value.trim();
+    if (role) mint.role = role;
+    mandate.mint = mint;
+  } else {
+    mandate.base = $("c-base").value;
+  }
+
+  // forge: op + header typ + set/del + (for base source) clearance/role overrides fold into set
+  const set = parseJson($("c-set").value, {}) || {};
+  if (source !== "mint") {
+    const cl = $("c-clearance").value.trim();
+    if (cl) set.clearance = isNaN(Number(cl)) ? cl : Number(cl);
+    const role = $("c-role").value.trim();
+    if (role) set.role = role;
+  }
+  const del = $("c-del").value.split(",").map((s) => s.trim()).filter(Boolean);
+  const typ = $("c-typ").value.trim();
+  let op = $("c-forge").value;
+  const forge = {};
+  if (op) forge.op = op;
+  if (typ) forge.header = {typ};
+  if (Object.keys(set).length) forge.set = set;
+  if (del.length) forge.del = del;
+  if (Object.keys(forge).length) {
+    if (!forge.op) forge.op = "keep-sig"; // editing claims/header reuses the signature
+    mandate.forge = forge;
+  }
+  if ($("c-revoke").checked) mandate.revoke = true;
+
+  const tweaks = {};
+  const ts = $("c-ts").value.trim();
+  if (ts) tweaks.ts_offset = Number(ts);
+  const nonce = $("c-nonce").value.trim();
+  if (nonce) tweaks.nonce = nonce;
+  if ($("c-sig").value !== "valid") tweaks.sig = $("c-sig").value;
+  const repeat = $("c-repeat").value.trim();
+  if (repeat && Number(repeat) > 1) tweaks.repeat = Number(repeat);
+  if ($("c-replay").checked) tweaks.replay = true;
+  const mutate = parseJson($("c-mutate").value, null);
+  if (mutate) tweaks.mutate_after = mutate;
+
+  const spec = {
+    id: "manual",
+    group: "manual",
+    title: "manual attack",
+    tool: $("c-tool").value,
+    arguments: parseJson($("c-args").value, {}) ?? {},
+  };
+  if (Object.keys(mandate).length) spec.mandate = mandate;
+  if (Object.keys(tweaks).length) spec.tweaks = tweaks;
+  return spec;
+}
+
+function renderSpec() {
+  const spec = buildSpec();
+  $("spec").textContent = JSON.stringify(spec, null, 2);
+  // reflect byo limits
+  const byo = isByo();
+  for (const id of ["c-revoke"]) $(id).disabled = byo;
+  return spec;
+}
+
+function syncSourceFields() {
+  const source = $("c-source").value;
+  $("c-base-wrap").hidden = source !== "base";
+  $("c-raw-wrap").hidden = source !== "raw";
+  $("c-mint-extra").hidden = source !== "mint";
+  renderSpec();
+}
+
+function renderComposeResult(f) {
+  const r = f.request || {};
+  const box = $("c-result");
+  const flags = (f.flags || []).map((fl) => `<span class="flag">${esc(fl.id)} ${esc(fl.detail || "")} (+${fl.points})</span>`).join("") || `<span class="muted">none</span>`;
+  const breaks = Object.entries(f.breaks || {}).map(([k, v]) => `<span class="break">${esc(k)} +${v}</span>`).join("") || `<span class="muted">none</span>`;
+  box.innerHTML = `<div class="result-box">
+    <h4>Outcome</h4>
+    <div><span class="out ${OUTCOME[f.outcome] || "flat"}">${esc(f.outcome)}</span>
+      ${f.got ? `<span class="badge ${esc(f.got)}">${esc(f.got)}</span>` : ""}
+      <span class="mono small">${esc(f.reason || "")}${f.status != null ? ` · HTTP ${esc(f.status)}` : ""}</span></div>
+    ${f.error ? `<div class="err small">${esc(f.error)}</div>` : ""}
+    ${f.detail ? `<div class="detail">${esc(f.detail)}</div>` : ""}
+    <table class="kv" style="margin-top:8px">
+      <tr><th>Level</th><td>${f.level ? lv(f.level, f.label || "") : "—"}</td></tr>
+      <tr><th>Points</th><td class="pts">${f.points || 0}</td></tr>
+      <tr><th>Flags</th><td>${flags}</td></tr>
+      <tr><th>Breaks</th><td>${breaks}</td></tr>
+      <tr><th>Rows</th><td>${f.rows != null ? esc(f.rows) : "—"} · ${esc(f.distinct_pupils || 0)} distinct pupils</td></tr>
+    </table>
+    <h4 style="margin-top:10px">Request sent</h4>
+    <pre class="spec">${esc(JSON.stringify(r.mandate ? {...r, mandate: `<${String(r.mandate).length} chars>`} : r, null, 2))}</pre>
+  </div>`;
+}
+
+async function compose() {
+  const spec = renderSpec();
+  const btn = $("c-run");
+  btn.disabled = true; btn.textContent = "Running…";
+  $("c-status").textContent = "";
+  const f = await post("/api/attack/compose", targetPayload({spec}));
+  btn.disabled = false; btn.textContent = "Run";
+  if (!f || !f.id) { $("c-status").textContent = (f && f.error) || "run failed"; return; }
+  f.id = `manual-${Date.now()}`;
+  f.group = "manual";
+  renderComposeResult(f);
+  state.findings.push(f);
+  renderFindings();
+}
+
+async function saveVector() {
+  const spec = buildSpec();
+  spec.id = `saved-${Date.now()}`;
+  const res = await post("/api/attack/save-vector", {spec});
+  if (res && res.saved != null) {
+    $("c-status").textContent = `saved to ${res.file} (${res.saved} total)`;
+    await loadVectors();
+  } else {
+    $("c-status").textContent = (res && res.error) || "save failed";
+  }
+}
+
+/* ---------------------------------------------------------------- export */
+
+function exportJson() {
+  const blob = new Blob([JSON.stringify({target: (currentTarget() || {}).id, findings: state.findings}, null, 2)], {type: "application/json"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `attack-findings-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+/* ---------------------------------------------------------------- loading */
+
+function renderTargets() {
+  const sel = $("target");
+  sel.innerHTML = state.targets.map((t) => `<option value="${esc(t.id)}">${esc(t.label)} · ${esc(t.mode)}</option>`).join("") || `<option>no targets</option>`;
+  onTargetChange();
+}
+
+function onTargetChange() {
+  const t = currentTarget();
+  const byo = t ? t.mode === "byo" : false;
+  const url = $("url");
+  url.hidden = !byo;
+  if (byo) url.value = t.url || "";
+  renderChips();
+  renderVectors();
+  renderSpec();
+}
+
+async function loadTargets() {
+  const body = await getJson("/api/attack/targets");
+  state.targets = body.targets || [];
+  renderTargets();
+}
+
+async function loadVectors() {
+  const body = await getJson("/api/attack/vectors");
+  state.vectors = body.vectors || [];
+  if (body.error && !state.vectors.length) $("vectors").innerHTML = `<p class="err">Could not load the catalog: ${esc(body.error)}</p>`;
+  else renderVectors();
+}
+
+/* ---------------------------------------------------------------- events */
+
+document.addEventListener("click", (event) => {
+  const run = event.target.closest("[data-run]");
+  if (run) { runVector(run.dataset.run, run); return; }
+  const group = event.target.closest("[data-group]");
+  if (group) { runGroup(group.dataset.group, group); return; }
+});
+$("target").addEventListener("change", onTargetChange);
+$("url").addEventListener("change", renderChips);
+$("reload").addEventListener("click", loadVectors);
+$("run-all").addEventListener("click", runAll);
+$("export").addEventListener("click", exportJson);
+$("clear").addEventListener("click", () => { state.findings = []; renderFindings(); });
+$("c-run").addEventListener("click", compose);
+$("c-save").addEventListener("click", saveVector);
+$("c-source").addEventListener("change", syncSourceFields);
+$("c-tool").addEventListener("change", () => { $("c-args").value = JSON.stringify(TOOL_ARGS[$("c-tool").value] || {}); renderSpec(); });
+$("composer").addEventListener("input", renderSpec);
+
+$("c-args").value = JSON.stringify(TOOL_ARGS.search);
+syncSourceFields();
+loadTargets();
+loadVectors();
+</script>
+</body>
+</html>

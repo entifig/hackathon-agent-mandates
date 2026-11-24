@@ -25,10 +25,13 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import attacks  # noqa: E402
+
 from questions import catalog, execute, execute_all, labels_in_force, mandates  # noqa: E402
 
 STATE = ROOT / "gateway" / "state"
 PAGE = Path(__file__).with_name("index.html")
+ATTACK_PAGE = Path(__file__).with_name("attack.html")
 GATEWAY = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8082")
 MCP = os.environ.get("MCP_URL", "http://127.0.0.1:8080")
 HOST = os.environ.get("BOARD_HOST", "127.0.0.1")
@@ -92,7 +95,30 @@ GET_ROUTES = {
     "/api/mandates": lambda: {"mandates": mandates()},
     "/api/labels": labels_in_force,
     "/api/questions": lambda: {"questions": catalog()},
+    "/api/attack/vectors": lambda: {"vectors": attacks.catalog()},
+    "/api/attack/targets": lambda: {"targets": attacks.targets()},
 }
+
+
+def _attack_post(path: str, body: dict) -> object:
+    # Saving a vector never touches a gateway, so it needs no target.
+    if path == "/api/attack/save-vector":
+        return attacks.save_vector(body.get("spec") or {})
+    # Own target fires at the board's own gateway; a BYO target carries its own URL (request wins over config).
+    target = attacks.load_target(body.get("target", "own"), body.get("url") or None)
+    http = attacks.bind_http(target.url or GATEWAY)
+    if path == "/api/attack/run":
+        vector = next((v for v in attacks.catalog() if v["id"] == body.get("vector_id")), None)
+        if vector is None:
+            return {"error": f"no such vector: {body.get('vector_id')!r}"}
+        return attacks.run_vector(target, vector, http)
+    if path == "/api/attack/run-all":
+        group = body.get("group")
+        findings = attacks.run_group(target, group, http) if group else attacks.run_all(target, http)
+        return {"findings": findings}
+    if path == "/api/attack/compose":
+        return attacks.compose(target, body.get("spec") or {}, http)
+    return {"error": "not found"}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -114,10 +140,21 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001  the page shows the error instead of waiting on a dropped socket
             self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
 
+    def _body(self) -> dict:
+        length = int(self.headers.get("content-length") or 0)
+        raw = self.rfile.read(length) if length else b""
+        try:
+            parsed = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
         if path in ("/", "/index.html"):
             self._send(HTTP_OK, PAGE.read_text(), "text/html; charset=utf-8")
+        elif path in ("/attack", "/attack.html"):
+            self._send(HTTP_OK, ATTACK_PAGE.read_text(), "text/html; charset=utf-8")
         elif path in GET_ROUTES:
             self._answer(GET_ROUTES[path])
         else:
@@ -130,6 +167,9 @@ class Handler(BaseHTTPRequestHandler):
             self._answer(lambda: execute(int(one.group(1)), _gateway_post))
         elif path == "/api/questions/run":
             self._answer(lambda: {"questions": execute_all(_gateway_post)})
+        elif path.startswith("/api/attack/"):
+            body = self._body()
+            self._answer(lambda: _attack_post(path, body))
         else:
             self._send(404, {"error": "not found"})
 

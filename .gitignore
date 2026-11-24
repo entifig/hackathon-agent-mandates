@@ -69,6 +69,16 @@ eval_pack/
 
 # Local board source. The global *.html rule is for rendered slides.
 !local_view/index.html
+!local_view/attack.html
+# The attack lab writes operator-composed vectors here at runtime; keep them local.
+local_view/saved_vectors.json
+
+# Day 2 attack lab: keep attack keys, minted mandates, target configs and any tokens local.
+day_2_attack/keys/
+day_2_attack/mandates/
+day_2_attack/targets/
+day_2_attack/*.pem
+day_2_attack/**/*.jwt
 
 .tmp/
 

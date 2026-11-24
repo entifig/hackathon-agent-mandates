@@ -60,9 +60,24 @@ What we want at the end is what you found out: where agent mandates hold and whe
 3. Open **[questions/README.md](questions/README.md)**. It lists the questions, 0 to 16. Each starts with something the administrator asks.
 4. Read [gateway/lib/gateway_verify.py](gateway/lib/gateway_verify.py). It walks through the current verification process.
 
-Ports: MCP server `:8080`, gateway `:8082`, question board `localhost:8090`, demo UI `localhost:8081/demo` (a walkthrough of issuing a mandate and making a call - feel free to extend, e.g - for human in the loop escalation.). `make hack` and `make run` start all four.
+Ports: MCP server `:8080`, gateway `:8082`, question board `127.0.0.1:8090` (loopback only — it also serves the Day 2 attack lab at `127.0.0.1:8090/attack`, which mints with your issuer key, so it is never exposed off the host), demo UI `localhost:8081/demo` (a walkthrough of issuing a mandate and making a call - feel free to extend, e.g - for human in the loop escalation.). `make hack` and `make run` start all four.
 `make test` and `make lint` run the tests and ruff. The data sources are listed in
 [mcp_server/data/synthetic/synthetic_manifest.json](mcp_server/data/synthetic/synthetic_manifest.json).
+
+### Attack lab (Day 2)
+
+`make attack_lab` brings up the stack and serves an attack board at **`127.0.0.1:8090/attack`**. It fires a catalog of
+adversarial requests at a gateway, scores each answer against [ATTACK_SCORING.md](day_2_attack/ATTACK_SCORING.md), and has
+a composer for one-off attacks (every mandate, forge, PoP and tool lever the engine exposes). Two target modes:
+
+- **Our gateway (mint)** — the board holds our issuer key, so it mints, forges, revokes and signs freely. This is why the
+  board binds loopback only and sits in the `tools` compose profile: a plain `docker compose up` never starts it, and no
+  other team can reach a port that signs with our issuer key.
+- **Bring your own** — drop another team's `target.json` (their gateway URL) and the mandate they gave us under
+  `day_2_attack/targets/<team>/`, with our attack key at `day_2_attack/attack.pem`. Vectors that need our issuer key are
+  greyed out; what remains is what a real attacker can actually send them.
+
+`make attack_scan TARGET=own` runs the same catalog headless and prints a scored table (`TARGET=<team>` for a BYO folder).
 
 ## Current flow architecture
 

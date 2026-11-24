@@ -74,8 +74,12 @@ services:
       context: .
       dockerfile: ./local_view/Dockerfile
     container_name: board
+    # The board (and its attack lab) mints mandates with our issuer key, so it must never be
+    # reachable by other teams. Keep it off the plain `docker compose up` stack (tools profile,
+    # the `make` targets enable it) and bind it to loopback so it answers only on the host itself.
+    profiles: ["tools"]
     ports:
-      - "8090:8090"
+      - "127.0.0.1:8090:8090"
     volumes:
       - ./gateway/state:/app/gateway/state
       - ./eval_pack:/app/eval_pack
