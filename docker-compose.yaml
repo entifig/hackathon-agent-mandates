@@ -85,11 +85,16 @@ services:
     volumes:
       - ./gateway/state:/app/gateway/state
       - ./eval_pack:/app/eval_pack
+      # Remote targets you define live here (day_2_attack/targets/<name>/): the endpoint, the issued
+      # mandate, a holder key to sign with, and an optional state/ bundle to mint against the remote.
+      - ./day_2_attack:/app/day_2_attack
       - ./mcp_server/data/synthetic/synthetic_manifest.json:/app/manifest.json:ro
     environment:
       - BOARD_HOST=0.0.0.0
       - BOARD_PORT=8090
       - GATEWAY_URL=http://gateway:8082
+      # Point the attack lab at a deployed gateway without moving the question board. Empty = attack local.
+      - ATTACK_URL=${ATTACK_URL:-}
       - MCP_URL=http://backend:8080
       - CLASSIFICATION_MANIFEST=/app/manifest.json
     healthcheck:

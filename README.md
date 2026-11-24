@@ -78,11 +78,28 @@ a composer for one-off attacks (every mandate, forge, PoP and tool lever the eng
 - **Our gateway (mint)** — the board holds our issuer key, so it mints, forges, revokes and signs freely. This is why the
   board binds loopback only and sits in the `tools` compose profile: a plain `docker compose up` never starts it, and no
   other team can reach a port that signs with our issuer key.
-- **Bring your own** — drop another team's `target.json` (their gateway URL) and the mandate they gave us under
-  `day_2_attack/targets/<team>/`, with our attack key at `day_2_attack/attack.pem`. Vectors that need our issuer key are
-  greyed out; what remains is what a real attacker can actually send them.
+- **Bring your own / a deployed gateway on the network** — define the endpoint, then paste whatever you were given.
 
-`make attack_scan TARGET=own` runs the same catalog headless and prints a scored table (`TARGET=<team>` for a BYO folder).
+Defining a remote target (works the same when the stack runs under Docker via `make hack`):
+
+```
+make attack_target URL=http://IP:PORT NAME=remote
+```
+
+That writes `day_2_attack/targets/remote/target.json` (the endpoint). Everything below is gitignored; paste what applies:
+
+| File under `day_2_attack/targets/<name>/` | What it is | Unlocks |
+| --- | --- | --- |
+| `default.jwt` / `feature.jwt` | a mandate you were issued | attacking that mandate as given (edit/forge-keep-sig, PoP, scope, bulk…) |
+| `agent.pem` | the **holder key** the mandate is bound to (`cnf`) | the lab signs requests with it, so legitimate calls pass proof-of-possession |
+| `state/issuer_key.pem` + `state/status_list.json` + `state/status_list.jwt` + `state/agent.pem` | the remote gateway's **state bundle** | minting, forging and revoking against the remote — the full catalog, same as own mode |
+
+Without a `state/` bundle, the vectors that need an issuer key are greyed out; what remains is what a real attacker can
+actually send. With one, the remote behaves like an own target. The attack lab fires at `ATTACK_URL` (or the target
+folder's `url`); the question board keeps talking to the local `GATEWAY_URL`.
+
+`make attack_scan TARGET=own` runs the same catalog headless and prints a scored table (`TARGET=remote` for a target folder;
+`GATEWAY_URL=http://IP:PORT` points `own` at a remote, or set `ATTACK_URL` in `.env` for the board).
 
 ## Current flow architecture
 

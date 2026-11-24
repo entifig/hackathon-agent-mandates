@@ -64,6 +64,18 @@ attack_lab: install  ## Day 2: start gateway, backend and the loopback-only atta
 attack_scan:  ## Day 2: headless scan — fire every runnable vector and score it. TARGET=own (default) or a day_2_attack/targets/<team> folder; own uses GATEWAY_URL
 	uv run --extra gateway python local_view/attacks.py --target $${TARGET:-own} --url $${GATEWAY_URL:-http://localhost:8082}
 
+attack_target:  ## Day 2: define a remote gateway to attack. URL=http://IP:PORT [NAME=remote]. Then paste the mandate/keys it prints.
+	@test -n "$(URL)" || { echo "usage: make attack_target URL=http://IP:PORT [NAME=remote]"; exit 1; }
+	@mkdir -p day_2_attack/targets/$(or $(NAME),remote)
+	@printf '{\n  "label": "%s",\n  "url": "%s"\n}\n' "$(or $(NAME),remote)" "$(URL)" > day_2_attack/targets/$(or $(NAME),remote)/target.json
+	@echo "wrote day_2_attack/targets/$(or $(NAME),remote)/target.json  ->  $(URL)"
+	@echo "Now paste what you were given into that folder (all gitignored):"
+	@echo "  default.jwt / feature.jwt  the mandate(s) you were issued, to attack as given"
+	@echo "  agent.pem                  the holder key the mandate is bound to (signs the requests)"
+	@echo "  state/issuer_key.pem + state/status_list.json + state/status_list.jwt + state/agent.pem"
+	@echo "                             the remote gateway's state bundle — unlocks mint/forge/revoke"
+	@echo "Then: open the lab, pick '$(or $(NAME),remote)', or  make attack_scan TARGET=$(or $(NAME),remote)"
+
 test:
 	cd mcp_server && uv sync --group dev --extra fastapi --extra synth && uv run python -m pytest --cov=mcp_server -v --cov-report=term-missing --cov-fail-under=0
 	uv run python -m pytest gateway/tests

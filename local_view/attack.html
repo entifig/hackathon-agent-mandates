@@ -209,7 +209,8 @@
       <div class="actions">
         <label class="small" for="target" style="color:var(--top-muted)">Target</label>
         <select id="target"></select>
-        <input id="url" type="text" placeholder="gateway URL" size="26" hidden>
+        <label class="small" for="url" style="color:var(--top-muted)">Endpoint</label>
+        <input id="url" type="text" placeholder="gateway URL" size="24" hidden>
         <button type="button" id="reload">Reload vectors</button>
         <button type="button" class="primary" id="run-all">Run every vector</button>
       </div>
@@ -449,7 +450,7 @@ const TOOL_ARGS = {
 const state = {
   targets: [], vectors: [], findings: [], target: null,
   expanded: new Set(), fFilter: {outcome: "all", text: ""},
-  vText: "", vCollapsed: new Set(),
+  vText: "", vCollapsed: new Set(), config: {attack_url: "", gateway_url: ""},
 };
 
 const $ = (id) => document.getElementById(id);
@@ -489,6 +490,18 @@ function isByo() {
   return t ? t.mode === "byo" : false;
 }
 
+// Whether the selected target can mint/forge/revoke: own, or a remote target with a pasted state/ bundle.
+function canMint() {
+  const t = currentTarget();
+  return t ? !!t.can_mint : false;
+}
+
+// The gateway this target fires at: an explicit URL field wins, then the folder's url, then the board's default.
+function targetUrl() {
+  const t = currentTarget();
+  return ($("url").value || "").trim() || (t && t.url) || state.config.attack_url || "";
+}
+
 /* ---------------------------------------------------------------- header + score */
 
 function renderChips() {
@@ -501,7 +514,8 @@ function renderChips() {
   const brkText = Object.keys(breaks).length ? Object.entries(breaks).map(([k, v]) => `${k} ${v}`).join(" · ") : "none";
   const chips = [
     `<span class="chip"><b>Target</b>${esc(t ? t.label : "—")}</span>`,
-    `<span class="chip"><b>Mode</b>${esc(t ? t.mode : "—")}${t && t.mode === "byo" ? ` · ${esc(t.url || "no url")}` : ""}</span>`,
+    `<span class="chip"><b>Fires at</b>${esc(targetUrl() || state.config.gateway_url || "local gateway")}</span>`,
+    `<span class="chip"><b>Mint</b>${canMint() ? "yes" : "mandate only"}</span>`,
     `<span class="chip ${points ? "score-bad" : ""}"><b>Points scored</b>${points}</span>`,
     `<span class="chip ${landed ? "score-bad" : "score-ok"}"><b>Need attention</b>${landed} of ${fs.length}</span>`,
     `<span class="chip"><b>Breaks</b>${esc(brkText)}</span>`,
@@ -694,7 +708,7 @@ function lastOutcome(id) {
 }
 
 function renderVectors() {
-  const byo = isByo();
+  const mints = canMint();
   const q = state.vText.trim().toLowerCase();
   const match = (v) => !q || [v.id, v.title, v.note, v.break].some((x) => String(x || "").toLowerCase().includes(q));
   const groups = {};
@@ -704,7 +718,7 @@ function renderVectors() {
   $("vectors").innerHTML = order.map((g) => {
     const collapsed = !q && state.vCollapsed.has(g);
     const rows = groups[g].map((v) => {
-      const blocked = byo && v.needs_mint;
+      const blocked = !mints && v.needs_mint;
       const tags = [];
       if (v.needs_mint) tags.push(`<span class="tag mint">mint</span>`);
       if (v.break) tags.push(`<span class="tag brk">${esc(v.break)}</span>`);
@@ -715,7 +729,7 @@ function renderVectors() {
           ${v.note ? `<div class="note">${esc(v.note)}</div>` : ""}
         </div>
         <div class="vlast">${lastOutcome(v.id)}</div>
-        <button type="button" data-run="${esc(v.id)}"${blocked ? " disabled title='needs our issuer key — own target only'" : ""}>Run</button>
+        <button type="button" data-run="${esc(v.id)}"${blocked ? " disabled title='needs an issuer key — own, or a remote target with a state/ bundle'" : ""}>Run</button>
       </div>`;
     }).join("");
     return `<div class="vgroup${collapsed ? " collapsed" : ""}">
@@ -735,7 +749,8 @@ function renderVectors() {
 function targetPayload(extra) {
   const t = currentTarget();
   const body = {target: t ? t.id : "own", ...extra};
-  if (t && t.mode === "byo") body.url = $("url").value || t.url || "";
+  const url = ($("url").value || "").trim();
+  if (url) body.url = url;  // an explicit URL overrides the folder url and the board's ATTACK_URL default
   return body;
 }
 
@@ -848,9 +863,11 @@ function buildSpec() {
 function renderSpec() {
   const spec = buildSpec();
   $("spec").textContent = JSON.stringify(spec, null, 2);
-  // reflect byo limits
-  const byo = isByo();
-  for (const id of ["c-revoke"]) $(id).disabled = byo;
+  // Revoke only reaches a gateway that serves the state we write, so it is an own-target lever.
+  const own = (currentTarget() || {}).mode === "own";
+  const revoke = $("c-revoke");
+  revoke.disabled = !own;
+  if (!own) revoke.checked = false;
   return spec;
 }
 
@@ -934,13 +951,18 @@ function renderTargets() {
 
 function onTargetChange() {
   const t = currentTarget();
-  const byo = t ? t.mode === "byo" : false;
   const url = $("url");
-  url.hidden = !byo;
-  if (byo) url.value = t.url || "";
+  url.hidden = false;  // any target may be aimed at a specific gateway (own/remote included)
+  url.value = (t && t.url) || state.config.attack_url || "";
+  url.placeholder = state.config.attack_url || state.config.gateway_url || "gateway URL";
   renderChips();
   renderVectors();
   renderSpec();
+}
+
+async function loadConfig() {
+  const body = await getJson("/api/attack/config");
+  if (body && !body.error) state.config = {attack_url: body.attack_url || "", gateway_url: body.gateway_url || ""};
 }
 
 async function loadTargets() {
@@ -1010,7 +1032,7 @@ $("composer").addEventListener("input", renderSpec);
 
 $("c-args").value = JSON.stringify(TOOL_ARGS.search);
 syncSourceFields();
-loadTargets();
+loadConfig().then(loadTargets);
 loadVectors();
 </script>
 </body>

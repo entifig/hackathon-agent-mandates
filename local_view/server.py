@@ -33,6 +33,9 @@ STATE = ROOT / "gateway" / "state"
 PAGE = Path(__file__).with_name("index.html")
 ATTACK_PAGE = Path(__file__).with_name("attack.html")
 GATEWAY = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8082")
+# Where the attack lab's own/remote target fires when a request carries no explicit URL. Set ATTACK_URL to a
+# deployed gateway (IP:PORT) to attack it while the question board keeps talking to the local GATEWAY_URL.
+ATTACK_URL = os.environ.get("ATTACK_URL", "")
 MCP = os.environ.get("MCP_URL", "http://127.0.0.1:8080")
 HOST = os.environ.get("BOARD_HOST", "127.0.0.1")
 PORT = int(os.environ.get("BOARD_PORT", "8090"))
@@ -97,6 +100,7 @@ GET_ROUTES = {
     "/api/questions": lambda: {"questions": catalog()},
     "/api/attack/vectors": lambda: {"vectors": attacks.catalog()},
     "/api/attack/targets": lambda: {"targets": attacks.targets()},
+    "/api/attack/config": lambda: {"attack_url": ATTACK_URL, "gateway_url": GATEWAY},
 }
 
 
@@ -104,9 +108,10 @@ def _attack_post(path: str, body: dict) -> object:
     # Saving a vector never touches a gateway, so it needs no target.
     if path == "/api/attack/save-vector":
         return attacks.save_vector(body.get("spec") or {})
-    # Own target fires at the board's own gateway; a BYO target carries its own URL (request wins over config).
+    # URL precedence: an explicit per-request URL, then the target folder's url, then ATTACK_URL, then the
+    # local gateway. So "own" fires at ATTACK_URL when set, and a remote target folder carries its own url.
     target = attacks.load_target(body.get("target", "own"), body.get("url") or None)
-    http = attacks.bind_http(target.url or GATEWAY)
+    http = attacks.bind_http(target.url or ATTACK_URL or GATEWAY)
     if path == "/api/attack/run":
         vector = next((v for v in attacks.catalog() if v["id"] == body.get("vector_id")), None)
         if vector is None:
