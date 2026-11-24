@@ -23,7 +23,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+sys.path[:0] = [str(ROOT), str(Path(__file__).resolve().parent)]  # siblings import when loaded by file path too
 
 import attacks  # noqa: E402
 
