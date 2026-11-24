@@ -125,7 +125,17 @@ def verify_mandate(token: str, registry, status_lists: dict[str, str]) -> dict:
     if claims["exp"] < now - CLOCK_SKEW:
         raise Reject("EXPIRED", claims["jti"])
 
-    sl = claims["status"]["status_list"]
+    # A verified mandate still has to carry the claims the status check and decide() read without a default.
+    # decide() catches only Reject, so a missing one is a 403 MANDATE_MALFORMED here, never an uncaught 500.
+    cnf = claims.get("cnf")
+    if not isinstance(cnf, dict) or not isinstance(cnf.get("jwk"), dict):
+        raise Reject("MANDATE_MALFORMED", "cnf.jwk missing")   # decide() reads it to check the holder's signature
+    status = claims.get("status")
+    if not isinstance(status, dict) or not isinstance(status.get("status_list"), dict):
+        raise Reject("MANDATE_MALFORMED", "status.status_list missing")
+    sl = status["status_list"]
+    if not isinstance(sl.get("uri"), str) or not isinstance(sl.get("idx"), int):
+        raise Reject("MANDATE_MALFORMED", "status_list needs a uri and an idx")
     sl_jwt = status_lists.get(sl["uri"])
     if sl_jwt is None:
         raise Reject("STATUS_UNAVAILABLE", sl["uri"])     # fail closed
