@@ -10,7 +10,7 @@ from fastmcp import FastMCP
 
 from gateway import cli, main
 from gateway.lib.common import b64u, generate_keypair, priv_from_pem, priv_to_pem, sign_bytes
-from gateway.lib.gateway_verify import Request
+from gateway.lib.gateway_verify import Gateway, Request
 from mcp_server.api.routes_mcp import aggregate as census_aggregate
 
 
@@ -210,3 +210,19 @@ def test_rounded_aggregate_suppresses_one_pupil_care_group(isolated_gateway):
     assert response.status_code == 200
     assert response.json()["decision"]["decision"] == "ALLOW"
     assert not any(row["InCareAtCurrentSchool"] == "1" for row in response.json()["result"])
+
+
+def test_replayed_request_is_denied_by_a_second_live_gateway_instance(isolated_gateway):
+    client, state, agent, token, _, _, calls = isolated_gateway
+    uri = main.state["status_uri"]
+    second = Gateway(
+        main.state["gateway"].registry,
+        status_lists={uri: (state / "status_list.jwt").read_text().strip()},
+        nonce_log=state / "seen_nonces.log",
+    )
+    body = signed_get(agent, token)
+    assert client.post("/tools/call", json=body).status_code == 200
+    baseline = len(calls)
+    decision = second.decide(Request(**body))
+    assert (decision.decision, decision.reason_code) == ("DENY", "POP_FAILED")
+    assert len(calls) == baseline
