@@ -26,6 +26,18 @@ CLOCK_SKEW = 30
 # Most rows one call may ask for (the MCP server's own default).
 # shortcut: per call only, many small calls still add up (question 11); add a per-mandate budget for that
 MAX_ROWS = 100
+# Smallest count released as itself. Every aggregate total and count is rounded to the nearest multiple, the
+# large ones too, so two answers cannot be subtracted to recover a small one. main.py lets GATEWAY_SMALL_COUNT
+# replace it; no mandate claim can.
+# shortcut: counts are census rows, and one pupil can be five of them
+SMALL_COUNT = 10
+# Columns that name one pupil: an aggregate grouped or filtered by one is that pupil's record.
+IDENTIFIERS = frozenset({"Psuedo ID", "DisplayName"})
+# A result at PRIVATE_LEVEL needs one of PRIVATE_ROLES as well as the clearance. The issuer signs the role the person
+# holds into the agent's mandate; the gateway says which roles open the data. main.py lets GATEWAY_PRIVATE_ROLES
+# replace the list; no mandate claim can.
+PRIVATE_LEVEL = 4
+PRIVATE_ROLES = frozenset({"safeguarding-lead"})
 
 
 class Reject(Exception):
@@ -44,13 +56,15 @@ class Decision:
     agent_id: str | None
     ts: float
     clearance: int | None = None  # from the mandate; main.py enforces it against the result
+    role: str | None = None  # from the mandate; main.py checks it when the result reaches PRIVATE_LEVEL
     detail: str = ""
     notice: str = ""  # for the person whose data it is, when an agent asks without clearance
     sensitivity: dict | None = None  # the labels on the result and the ones that decided
+    disclosure: dict | None = None  # how the result was changed before release
 
     def to_dict(self) -> dict:
         raw = asdict(self)
-        for key in ("notice", "sensitivity"):
+        for key in ("role", "notice", "sensitivity", "disclosure"):
             if not raw[key]:
                 del raw[key]
         return raw
@@ -130,6 +144,12 @@ def _constraint_holds(key: str, raw, allowed) -> bool:
     return str(raw) in {str(item) for item in allowed}
 
 
+def _identifiers(arguments: dict) -> list[str]:
+    group_by, where = arguments.get("group_by"), arguments.get("where")
+    fields = [*(group_by if isinstance(group_by, list) else []), *(where if isinstance(where, dict) else [])]
+    return [field for field in fields if isinstance(field, str) and field in IDENTIFIERS]
+
+
 def check_request(req: Request, scope: list[dict], deny: list[str], step_up_patterns: list[str]) -> tuple[str, str, str]:
     name = f"{req.server}.{req.tool}"
     for pat in deny:
@@ -159,6 +179,9 @@ def check_request(req: Request, scope: list[dict], deny: list[str], step_up_patt
         # An empty search matches every row of the granted school. Question 0 searches all have a query.
         if req.tool == "search" and not str(req.arguments.get("query", "")).strip():
             return "DENY", "TOO_MUCH", "empty query matches every row"
+        named = _identifiers(req.arguments) if req.tool == "aggregate" else []
+        if named:
+            return "DENY", "TOO_FINE", f"{named[0]} makes each group one pupil"
         for pat in step_up_patterns:
             if fnmatch.fnmatch(name, pat):
                 return "STEP_UP", "SENSITIVE_TOOL", pat
@@ -198,8 +221,27 @@ def result_levels(tool: str, arguments: dict, result, columns: dict[str, int],
         stem = path.rsplit("/", 1)[-1].removeprefix("synthetic_").removesuffix(".csv")
         return {stem: tables.get(stem, max_level)}
     rows = result if isinstance(result, list) else [result]
-    return {_key_name(k, arguments): _key_level(k, arguments, columns, max_level)
-            for r in rows if isinstance(r, dict) for k in r}
+    levels = {_key_name(k, arguments): _key_level(k, arguments, columns, max_level)
+              for r in rows if isinstance(r, dict) for k in r}
+    where = arguments.get("where") if tool == "aggregate" else None
+    if isinstance(where, dict):
+        # a count of one ethnic group says as much about ethnicity as grouping by it, with or without rows
+        levels.update({f"{k} (filter)": columns.get(k, max_level) for k in where})
+    return levels
+
+
+def round_counts(result, base: int):
+    """Every aggregate total and count to the nearest multiple of base, halves up."""
+    if not isinstance(result, list):
+        return result
+
+    def near(value):
+        return (value + base // 2) // base * base if type(value) is int else value
+
+    return [
+        {k: near(v) if k in ("total", "count") else v for k, v in row.items()} if isinstance(row, dict) else row
+        for row in result
+    ]
 
 
 def sensitivity_record(levels: dict[str, int], level_names: dict[int, str], clearance: int | None) -> dict:
@@ -276,8 +318,12 @@ class Gateway:
                                 notice=no_clearance_notice(claims, req), **base)
             if not isinstance(clearance, int) or not 1 <= clearance <= 4:
                 raise Reject("CLEARANCE_INVALID", f"clearance={clearance!r} outside 1-4")
+            role = claims.get("role")
+            if role is not None and not (isinstance(role, str) and role):
+                raise Reject("ROLE_INVALID", f"role={role!r} is not a role name")
 
             decision, code, detail = check_request(req, claims["scope"], claims["deny"], self.step_up)
-            return Decision(decision, code, agent_id=claims["agent_id"], clearance=clearance, detail=detail, **base)
+            return Decision(decision, code, agent_id=claims["agent_id"], clearance=clearance, role=role,
+                            detail=detail, **base)
         except Reject as r:
             return Decision("DENY", r.code, agent_id=None, detail=r.detail, **base)
