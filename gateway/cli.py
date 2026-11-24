@@ -5,7 +5,7 @@ never do, and until when. The gateway checks the note on every call. The issuer 
 
     python -m gateway.cli init                                      # issuer: one-off setup
     python -m gateway.cli keygen -o agent.pem                       # agent: make a key, send the printed JWK
-    python -m gateway.cli issue --agent-key team.jwk -o mandate.jwt # issuer: write a mandate for that key
+    python -m gateway.cli issue --agent-key team.jwk --clearance 4 --role safeguarding-lead -o mandate.jwt
     python -m gateway.cli discover --url http://localhost:8082      # agent: see what a gateway offers
     python -m gateway.cli revoke --idx 0                            # issuer: cancel mandate 0
     python -m gateway.cli decode mandate.jwt                        # anyone: read what a mandate says
