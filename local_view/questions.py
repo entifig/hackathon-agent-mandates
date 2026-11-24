@@ -7,7 +7,7 @@ are open: Run shows what the gateway decides today, and the row says what is
 still unread.
 
 Every mandate the board runs under is issued from gateway/state and renewed
-when it expires or predates the clearance claim. The board's own mandates
+when it expires or predates the clearance or role claim. The board's own mandates
 live in gateway/state/board/, which git ignores with the rest of the state.
 """
 
@@ -26,6 +26,8 @@ from gateway.lib.common import b64u_decode, priv_from_pem
 from gateway.lib.gateway_verify import (
     IDENTIFIERS,
     MAX_ROWS,
+    PRIVATE_LEVEL,
+    PRIVATE_ROLES,
     SMALL_COUNT,
     result_levels,
     sensitivity_maps,
@@ -45,6 +47,7 @@ FRESH = 60  # a mandate with less left than this is renewed before a run
 HTTP_OK, HTTP_FORBIDDEN = 200, 403
 STEP_UP = ("*.write", "*.draft")  # the Gateway default in gateway_verify.py
 CELLS_SHOWN = 2  # an aggregate with this many rows or fewer is printed on its card
+ROLE = "safeguarding-lead"  # in the gateway's PRIVATE_ROLES, so it opens level 4
 LIVE = "live"
 _ISSUE = threading.Lock()  # issuing rewrites status_list.json, so one issue at a time
 
@@ -54,8 +57,15 @@ MANDATES: dict[str, dict] = {
     "castleton-4": {
         "scope": _CASTLETON_SCOPE,
         "clearance": 4,
+        "role": ROLE,
         "purpose": _CASTLETON_PURPOSE,
-        "label": "Castleton, clearance 4",
+        "label": "Castleton, clearance 4, safeguarding lead",
+    },
+    "castleton-4-norole": {
+        "scope": _CASTLETON_SCOPE,
+        "clearance": 4,
+        "purpose": _CASTLETON_PURPOSE,
+        "label": "Castleton, clearance 4, no role",
     },
     "castleton-2": {
         "scope": _CASTLETON_SCOPE,
@@ -82,8 +92,9 @@ MANDATES: dict[str, dict] = {
         f"counts-{level}": {
             "scope": [{"server": SERVER, "tools": ["aggregate"], "constraints": {"table": [CENSUS]}}],
             "clearance": level,
+            **({"role": ROLE} if level == PRIVATE_LEVEL else {}),
             "purpose": "School-level counts for the local authority",
-            "label": f"Counts, clearance {level}",
+            "label": f"Counts, clearance {level}" + (", safeguarding lead" if level == PRIVATE_LEVEL else ""),
         }
         for level in (3, 4)
     },
@@ -152,9 +163,9 @@ _META: list[tuple[int, str, str, str, str, str]] = [
         6,
         "answered",
         "Send me the full records for Castleton's pupils, ethnicity and care status included.",
-        "The clearance claim is checked before the scope. Without one the call is CLEARANCE_MISSING, and the decision carries a notice naming the authenticated agent. After the data server answers, every key of the result is looked up in the manifest, which is re-read on each call. The most restrictive label decides, so Ethnicity at 4 outranks URN at 1. Above the clearance the result is dropped with CLEARANCE_TOO_LOW.",
-        "Unresolved: the clearance is whatever the issuer signed, and nothing records consent from the pupil or a parent. The notice goes back in the response. Nothing delivers it to the person yet.",
-        "Castleton at clearance 4 gets the full record. Under clearance 2 the same request is refused because Ethnicity and InCareAtCurrentSchool are level 4, and the Year 11 names at level 2 still pass. With no clearance the call is refused, and the notice says which agent asked.",
+        "The clearance claim is checked before the scope. Without one the call is CLEARANCE_MISSING, and the decision carries a notice naming the authenticated agent. After the data server answers, every key of the result is looked up in the manifest, which is re-read on each call. The most restrictive label decides, so Ethnicity at 4 outranks URN at 1. Above the clearance the result is dropped with CLEARANCE_TOO_LOW. Level 4 also needs a role. The issuer signs the role the person holds into the agent's mandate, and the gateway lists the roles that open level 4: PRIVATE_ROLES, safeguarding-lead unless GATEWAY_PRIVATE_ROLES says otherwise. Without a listed role the result is dropped with ROLE_REQUIRED.",
+        "Unresolved: the clearance and the role are whatever the issuer signed. The gateway cannot tell whether the person still holds the role (question 13), and nothing records consent from the pupil or a parent. The notice goes back in the response. Nothing delivers it to the person yet.",
+        "Castleton at clearance 4 with the safeguarding-lead role gets the full record. At clearance 4 with no role the same request is refused with ROLE_REQUIRED. Under clearance 2 it is refused because Ethnicity and InCareAtCurrentSchool are level 4, and the Year 11 names at level 2 still pass. With no clearance the call is refused, and the notice says which agent asked.",
     ),
     (
         7,
@@ -168,9 +179,9 @@ _META: list[tuple[int, str, str, str, str, str]] = [
         8,
         "answered",
         "How many pupils in care does each school have, split by ethnic group?",
-        "Both. Before the call, an aggregate grouped or filtered by Psuedo ID is refused as TOO_FINE, because each group would be one pupil. After the call the labels decide first: a count needs its measure's clearance, and each group_by key and where filter needs its own. Then the gateway rounds every total and count to the nearest 10, so a count below 10 comes out as 0 or 10. The large counts are rounded too, because that is what stops subtraction. Brookmere has 74 meal rows and 69 of them are WHIT, so two exact answers would give away the other 5. Rounded, both read 70. The floor is SMALL_COUNT in the gateway, 10 unless GATEWAY_SMALL_COUNT says otherwise, and no mandate claim changes it.",
+        "Both. Before the call, an aggregate grouped or filtered by Psuedo ID is refused as TOO_FINE, because each group would be one pupil. After the call the labels decide first: a count needs its measure's clearance, and each group_by key and where filter needs its own. A level 4 count, such as care by ethnic group, also needs a listed role, as in question 6. Then the gateway rounds every total and count to the nearest 10, so a count below 10 comes out as 0 or 10. The large counts are rounded too, because that is what stops subtraction. Brookmere has 74 meal rows and 69 of them are WHIT, so two exact answers would give away the other 5. Rounded, both read 70. The floor is SMALL_COUNT in the gateway, 10 unless GATEWAY_SMALL_COUNT says otherwise, and no mandate claim changes it.",
         "Unresolved: counts are census rows, and one pupil can be five of them, so one or two children can still round to 10. A where filter on enough other columns can still single out one pupil. Counting each pupil once, by naming one census per answer or counting distinct pupils in the gateway, would close both.",
-        "Free school meals by school are released, rounded to tens. Care by school and ethnic group is refused at clearance 3. At clearance 4 every cell comes back as a multiple of 10: 0, 10 or 20. Brookmere's count and its WHIT count both read 70, so subtracting them gives nothing away. Grouping by Psuedo ID is refused before the call.",
+        "Free school meals by school are released, rounded to tens. Care by school and ethnic group is refused at clearance 3. At clearance 4 with the safeguarding-lead role every cell comes back as a multiple of 10: 0, 10 or 20. Brookmere's count and its WHIT count both read 70, so subtracting them gives nothing away. Grouping by Psuedo ID is refused before the call.",
     ),
     (
         9,
@@ -245,10 +256,17 @@ _ANSWERED: dict[int, list[dict]] = {
     6: [
         {
             "mandate": "castleton-4",
-            "name": "full record under clearance 4",
+            "name": "full record under clearance 4, safeguarding lead",
             "tool": "pupil",
             "arguments": _RECORD,
             "expect": "ALLOW",
+        },
+        {
+            "mandate": "castleton-4-norole",
+            "name": "the same record under clearance 4, no role",
+            "tool": "pupil",
+            "arguments": _RECORD,
+            "expect": "ROLE_REQUIRED",
         },
         {
             "mandate": "castleton-2",
@@ -447,21 +465,24 @@ def _lasts(claims: dict) -> bool:
     return claims.get("exp", 0) > time.time() + FRESH
 
 
+def _current(claims: dict) -> bool:
+    """Lasts past FRESH and carries the claims make writes today: a clearance, and the level 4 role."""
+    return _lasts(claims) and claims.get("clearance") is not None and claims.get("role") == ROLE
+
+
 def ensure_pack() -> None:
-    """eval_pack as make eval_build writes it, rebuilt when it expires or predates the clearance claim."""
+    """eval_pack as make eval_build writes it, rebuilt when it expires or predates the clearance or role claim."""
     with _ISSUE:
-        claims = _read_jwt(PACK / "valid.jwt")
-        if _lasts(claims) and claims.get("clearance") is not None:
+        if _current(_read_jwt(PACK / "valid.jwt")):
             return
         ev.main(["build", "--state", str(STATE), "-o", str(PACK)])
 
 
 def ensure_local_mandate() -> None:
-    """mandate.jwt as make gateway_issue writes it, renewed when it expires or has no clearance."""
+    """mandate.jwt as make gateway_issue writes it, renewed when it expires or predates the clearance or role claim."""
     path = STATE / "mandate.jwt"
     with _ISSUE:
-        claims = _read_jwt(path)
-        if _lasts(claims) and claims.get("clearance") is not None:
+        if _current(_read_jwt(path)):
             return
         token, _idx = issue_mandate(
             STATE,
@@ -472,7 +493,7 @@ def ensure_local_mandate() -> None:
             purpose="Pupil-data lookups for school SCH01",
             principal="officer:jsmith",
             org="school:SCH01",
-            extra={"clearance": 4},
+            extra={"clearance": 4, "role": ROLE},
         )
         path.write_text(token)
 
@@ -482,7 +503,9 @@ def ensure_board_mandate(stem: str) -> None:
     path = BOARD / f"{stem}.jwt"
     with _ISSUE:
         claims = _read_jwt(path)
-        if _lasts(claims) and all(claims.get(key) == spec[key] for key in ("scope", "clearance", "purpose")):
+        if _lasts(claims) and all(
+            claims.get(key) == spec.get(key) for key in ("scope", "clearance", "role", "purpose")
+        ):
             return
         BOARD.mkdir(exist_ok=True)
         token, _idx = issue_mandate(
@@ -494,7 +517,7 @@ def ensure_board_mandate(stem: str) -> None:
             purpose=spec["purpose"],
             principal="officer:jsmith",
             org="board:local",
-            extra={} if spec["clearance"] is None else {"clearance": spec["clearance"]},
+            extra={key: spec[key] for key in ("clearance", "role") if spec.get(key) is not None},
         )
         path.write_text(token)
 
@@ -545,6 +568,7 @@ def mandates() -> list[dict]:
                 "label": label,
                 "file": _rel(path),
                 "clearance": claims.get("clearance"),
+                "role": claims.get("role"),
                 "scope": claims.get("scope") or [],
                 "deny": claims.get("deny") or [],
                 "exp": claims.get("exp"),
@@ -702,7 +726,15 @@ def _label_steps(tool: str, arguments: dict, claims: dict) -> list[dict]:
     value = f"level {expected['level']} from {source}"
     if isinstance(clearance, int) and expected["level"] > clearance:
         return [_step("labels", value, f"clearance {clearance}", "CLEARANCE_TOO_LOW, the result is dropped", "fail")]
-    steps = [_step("labels", value, f"clearance {clearance}", "within clearance, ALLOW", "allow")]
+    if expected["level"] < PRIVATE_LEVEL:
+        steps = [_step("labels", value, f"clearance {clearance}", "within clearance, ALLOW", "allow")]
+    else:
+        role = claims.get("role")
+        roles = f"{', '.join(sorted(PRIVATE_ROLES))} (PRIVATE_ROLES, a gateway setting)"
+        steps = [_step("labels", value, f"clearance {clearance}", "within clearance", "pass")]
+        if not (isinstance(role, str) and role in PRIVATE_ROLES):
+            return [*steps, _step("role", role or "none", roles, "ROLE_REQUIRED, the result is dropped", "fail")]
+        steps.append(_step("role", role, roles, "a listed role, ALLOW", "allow"))
     if tool == "aggregate":
         nearest = f"the nearest {SMALL_COUNT} (SMALL_COUNT, a gateway setting)"
         steps.append(_step("rounding", "every total and count", nearest, "rounded before release", "pass"))
