@@ -270,12 +270,12 @@
 <script>
 const STAGES = [
   {title: "Issuer", text: "Signs the mandate: scope, deny, clearance, the person's role, expiry, and a status index.", codes: []},
-  {title: "Mandate", text: "Accredited issuer, signature, nbf and exp within 30 s, then the status bit.", codes: ["ISSUER_NOT_ACCREDITED", "SIG_INVALID", "NOT_YET_VALID", "EXPIRED", "REVOKED", "STATUS_UNAVAILABLE"]},
-  {title: "Proof of possession", text: "Request signed by the key in cnf.jwk, a fresh nonce, time within 300 s.", codes: ["POP_FAILED"]},
-  {title: "Clearance", text: "A level 1 to 4 must be on the mandate. Without one, the person is told which agent asked. A role, if any, must be a name.", codes: ["CLEARANCE_MISSING", "CLEARANCE_INVALID", "ROLE_INVALID"]},
+  {title: "Mandate", text: "A token that parses, an accredited issuer, signature, nbf and exp within 30 s, then the status bit.", codes: ["MANDATE_MALFORMED", "ISSUER_NOT_ACCREDITED", "SIG_INVALID", "NOT_YET_VALID", "EXPIRED", "REVOKED", "STATUS_UNAVAILABLE"]},
+  {title: "Proof of possession", text: "Request signed by the key in cnf.jwk, time within 300 s, and a nonce not seen before, also across a restart.", codes: ["REQUEST_MALFORMED", "POP_FAILED"]},
+  {title: "Clearance", text: "A level 1 to 4 must be on the mandate. Without one, the person is told which agent asked. A role, if any, must be a name, and its end date a time.", codes: ["CLEARANCE_MISSING", "CLEARANCE_INVALID", "ROLE_INVALID"]},
   {title: "Scope", text: "Deny patterns, then any one whole entry. At most 100 rows, no empty search, no aggregate by pupil id. write and draft are held.", codes: ["DENIED_BY_RULE", "CONSTRAINT_MISSING", "CONSTRAINT_VIOLATED", "OUT_OF_SCOPE", "TOO_MUCH", "TOO_FINE", "STEP_UP"]},
-  {title: "Data server", text: "The call is forwarded. The gateway holds the result before the agent sees it.", codes: []},
-  {title: "Labels", text: "Every key and filter of the result is looked up in the manifest. The highest level decides. Level 4 also needs a role the gateway lists.", codes: ["CLEARANCE_TOO_LOW", "ROLE_REQUIRED", "ALLOW"]},
+  {title: "Labels", text: "Before the call, every key the tool can return and every filter is looked up in the manifest. The highest level decides. Level 4 also needs a role the gateway lists, held until its end date.", codes: ["CLEARANCE_TOO_LOW", "ROLE_REQUIRED", "ROLE_EXPIRED"]},
+  {title: "Data server", text: "The call is forwarded. The gateway holds the result and reads its labels again before the agent sees it.", codes: ["ALLOW"]},
   {title: "Rounding", text: "Aggregate totals and counts leave rounded to the nearest 10, so no count below 10 is released as itself.", codes: []},
 ];
 const STATE_NAME = {solved: "Solved", answered: "Answered", open: "Open"};

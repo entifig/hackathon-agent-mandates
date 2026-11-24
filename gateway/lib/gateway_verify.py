@@ -15,6 +15,7 @@ import fnmatch
 import posixpath
 import time
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import jwt
 
@@ -23,6 +24,7 @@ from .status_list import is_revoked
 
 POLICY_VERSION = "2026-11-18.1"
 CLOCK_SKEW = 30
+REPLAY_WINDOW = 300  # seconds a request's ts may be from the gateway's clock; a nonce is remembered that long
 # Most rows one call may ask for (the MCP server's own default).
 # shortcut: per call only, many small calls still add up (question 11); add a per-mandate budget for that
 MAX_ROWS = 100
@@ -38,6 +40,9 @@ IDENTIFIERS = frozenset({"Psuedo ID", "DisplayName"})
 # replace the list; no mandate claim can.
 PRIVATE_LEVEL = 4
 PRIVATE_ROLES = frozenset({"safeguarding-lead"})
+# The table search and pupil read. The labels themselves are public; any other file without a label is not.
+CENSUS_TABLE = "personal_data_school_census"
+PUBLIC_FILES = frozenset({"synthetic/synthetic_manifest.json"})
 
 
 class Reject(Exception):
@@ -57,6 +62,7 @@ class Decision:
     ts: float
     clearance: int | None = None  # from the mandate; main.py enforces it against the result
     role: str | None = None  # from the mandate; main.py checks it when the result reaches PRIVATE_LEVEL
+    role_exp: int | None = None  # from the mandate; when the role ends, which can be before the mandate does
     detail: str = ""
     notice: str = ""  # for the person whose data it is, when an agent asks without clearance
     sensitivity: dict | None = None  # the labels on the result and the ones that decided
@@ -64,7 +70,7 @@ class Decision:
 
     def to_dict(self) -> dict:
         raw = asdict(self)
-        for key in ("role", "notice", "sensitivity", "disclosure"):
+        for key in ("role", "role_exp", "notice", "sensitivity", "disclosure"):
             if not raw[key]:
                 del raw[key]
         return raw
@@ -92,14 +98,21 @@ class Request:
 
 def verify_mandate(token: str, registry, status_lists: dict[str, str]) -> dict:
     """Returns the verified claims. Raises Reject."""
-    hdr = jwt.get_unverified_header(token)
-    if hdr.get("typ") != "mandate+jwt":
-        raise Reject("WRONG_TOKEN_TYPE", hdr.get("typ"))
-    unverified = jwt.decode(token, options={"verify_signature": False})
+    # Nothing here is verified yet, so anyone can send it: a token that does not parse is a denial, not a crash.
+    try:
+        hdr = jwt.get_unverified_header(token)
+        if hdr.get("typ") != "mandate+jwt":
+            raise Reject("WRONG_TOKEN_TYPE", str(hdr.get("typ")))
+        unverified = jwt.decode(token, options={"verify_signature": False})
+    except jwt.PyJWTError as e:
+        raise Reject("MANDATE_MALFORMED", str(e))
+    iss, kid = unverified.get("iss"), hdr.get("kid", "")
+    if not isinstance(iss, str) or not isinstance(kid, str):
+        raise Reject("MANDATE_MALFORMED", "iss and kid must be strings")
 
-    pub = registry.issuer_key(unverified["iss"], hdr.get("kid", ""))
+    pub = registry.issuer_key(iss, kid)
     if pub is None:
-        raise Reject("ISSUER_NOT_ACCREDITED", unverified["iss"])
+        raise Reject("ISSUER_NOT_ACCREDITED", iss)
     try:
         claims = jwt.decode(token, pub_to_pem(pub), algorithms=["EdDSA"],
                             options={"verify_exp": False, "verify_nbf": False, "require": ["exp", "iss", "jti"]})
@@ -216,8 +229,10 @@ def result_levels(tool: str, arguments: dict, result, columns: dict[str, int],
         return {}
     if tool == "get":
         path = _norm_path(str(arguments.get("path", "")))
-        if not path.endswith(".csv"):
+        if path in PUBLIC_FILES:
             return {path: 1}
+        if not path.endswith(".csv"):
+            return {path: max_level}                   # a file with no label is not public
         stem = path.rsplit("/", 1)[-1].removeprefix("synthetic_").removesuffix(".csv")
         return {stem: tables.get(stem, max_level)}
     rows = result if isinstance(result, list) else [result]
@@ -227,6 +242,48 @@ def result_levels(tool: str, arguments: dict, result, columns: dict[str, int],
     if isinstance(where, dict):
         # a count of one ethnic group says as much about ethnicity as grouping by it, with or without rows
         levels.update({f"{k} (filter)": columns.get(k, max_level) for k in where})
+    return levels
+
+
+def expected_shape(tool: str, arguments: dict, table_columns: dict[str, dict[str, int]]) -> object:
+    """A result with every key the tool can return, so the labels can be read from the request alone.
+
+    None for a tool the gateway has no shape for.
+    """
+    census = dict.fromkeys(table_columns.get(CENSUS_TABLE, {}))
+    group_by = arguments.get("group_by")
+    group_by = [g for g in group_by if isinstance(g, str)] if isinstance(group_by, list) else []
+    shapes = {
+        "search": [census],
+        "pupil": {
+            **census,
+            "DisplayName": None,
+            **dict.fromkeys(table_columns.get("personal_data_deprivation", {})),
+        },
+        "roster": [{"Psuedo ID": None, "DisplayName": None}],
+        "draft": [{"Psuedo ID": None, "letter": None}],
+        "aggregate": [{**dict.fromkeys(group_by), "total": 0, "count": 0}],
+        "write": dict.fromkeys(("ts", "pupil_id", "urn", "column", "before", "after", "reason")),
+        "classification": dict.fromkeys(("levels", "tables", "columns")),
+        "get": [],
+    }
+    return shapes.get(tool)
+
+
+def request_levels(tool: str, arguments: dict, table_columns: dict[str, dict[str, int]],
+                   columns: dict[str, int], tables: dict[str, int], max_level: int) -> dict[str, int]:
+    """The labels on everything the call could return, decided before it is forwarded.
+
+    A refusal made after the call depends on what matched, so a 403 against a 200 [] tells the agent whether
+    a row exists. Deciding from the request alone gives the same answer whatever the data holds.
+    """
+    shape = expected_shape(tool, arguments, table_columns)
+    if shape is None:
+        return {f"{tool} (no labels)": max_level}
+    levels = result_levels(tool, arguments, shape, columns, tables, max_level)
+    group_by = arguments.get("group_by")
+    if tool == "aggregate" and isinstance(group_by, list) and not all(isinstance(g, str) for g in group_by):
+        levels["group_by (not column names)"] = max_level  # the arguments are the agent's: label, never crash
     return levels
 
 
@@ -289,28 +346,59 @@ def no_clearance_notice(claims: dict, req: Request) -> str:
 # ---------------------------------------------------------------- the pipeline
 
 class Gateway:
-    def __init__(self, registry, status_lists: dict[str, str], step_up_patterns: list[str] | None = None):
+    def __init__(self, registry, status_lists: dict[str, str], step_up_patterns: list[str] | None = None,
+                 nonce_log: Path | None = None):
         self.registry = registry
         self.status_lists = status_lists
         self.step_up = step_up_patterns or ["*.write", "*.draft"]
-        self._seen_nonces: set[str] = set()
+        # nonce digest -> the time its request leaves the window, after which a replay fails on ts anyway
+        self._seen_nonces: dict[str, int] = {}
+        self._nonce_log = nonce_log
+        if nonce_log is not None:
+            self._load_nonces(nonce_log)
+
+    def _load_nonces(self, log: Path) -> None:
+        """Nonces accepted before a restart or a state reload still count while their request is in the window.
+
+        shortcut: one file, one process. Replicas need a shared store. The file is trimmed here, not while running.
+        """
+        now = int(time.time())
+        for line in log.read_text().splitlines() if log.exists() else []:
+            expires, _, digest = line.partition(" ")
+            if expires.isdigit() and digest and int(expires) >= now:
+                self._seen_nonces[digest] = int(expires)
+        # written at start-up so a state dir that cannot be written fails here, not in the middle of a call
+        log.write_text("".join(f"{expires} {digest}\n" for digest, expires in self._seen_nonces.items()))
+
+    def _remember_nonce(self, digest: str, expires: int) -> None:
+        self._seen_nonces[digest] = expires
+        if self._nonce_log is not None:
+            with self._nonce_log.open("a") as log:
+                log.write(f"{expires} {digest}\n")
 
     def decide(self, req: Request) -> Decision:
-        base = dict(policy_version=POLICY_VERSION, mandate_hash=sha256_hex(req.mandate.encode()),
-                    request_hash=sha256_hex(req.signing_input()), ts=time.time())
+        # Everything in the request is the sender's. Text that cannot be hashed (a lone surrogate) is text no key
+        # signed, so it is a denial like any other and never an error page.
+        try:
+            base = dict(policy_version=POLICY_VERSION, mandate_hash=sha256_hex(req.mandate.encode()),
+                        request_hash=sha256_hex(req.signing_input()), ts=time.time())
+            nonce = sha256_hex(req.nonce.encode())
+        except ValueError as e:
+            return Decision("DENY", "REQUEST_MALFORMED", POLICY_VERSION, "", "", None, time.time(),
+                            detail=f"the request cannot be hashed: {type(e).__name__}")
         try:
             claims = verify_mandate(req.mandate, self.registry, self.status_lists)
             jwk = claims["cnf"]["jwk"]
-            if abs(req.ts - time.time()) > 300:
+            if abs(req.ts - int(time.time())) > REPLAY_WINDOW:      # whole seconds: a huge ts must not overflow
                 raise Reject("POP_FAILED", "request timestamp outside window")
-            if req.nonce in self._seen_nonces:
+            if nonce in self._seen_nonces:
                 raise Reject("POP_FAILED", "replayed nonce")
             if not verify_bytes(jwk_to_pub(jwk), req.signing_input(), req.sig):
                 raise Reject("POP_FAILED", f"bad signature for jkt {jwk_thumbprint(jwk)}")
-            self._seen_nonces.add(req.nonce)
+            self._remember_nonce(nonce, req.ts + REPLAY_WINDOW)
 
             # Question 6: no clearance claim is an error, not an assumption. The caller
-            # fixes the mandate (re-issue with --claims '{"clearance": N}'), not the gateway.
+            # fixes the mandate (re-issue with --clearance N), not the gateway.
             clearance = claims.get("clearance")
             if clearance is None:
                 return Decision("DENY", "CLEARANCE_MISSING", agent_id=claims["agent_id"],
@@ -321,9 +409,14 @@ class Gateway:
             role = claims.get("role")
             if role is not None and not (isinstance(role, str) and role):
                 raise Reject("ROLE_INVALID", f"role={role!r} is not a role name")
+            # The person can hold the role for less time than the mandate lasts. A date with no role to end, or
+            # one that is not a time, is the issuer's mistake: refuse it rather than guess which was meant.
+            role_exp = claims.get("role_exp")
+            if role_exp is not None and (role is None or type(role_exp) is not int):
+                raise Reject("ROLE_INVALID", f"role_exp={role_exp!r} needs a role and a unix time")
 
             decision, code, detail = check_request(req, claims["scope"], claims["deny"], self.step_up)
             return Decision(decision, code, agent_id=claims["agent_id"], clearance=clearance, role=role,
-                            detail=detail, **base)
+                            role_exp=role_exp, detail=detail, **base)
         except Reject as r:
             return Decision("DENY", r.code, agent_id=None, detail=r.detail, **base)

@@ -171,6 +171,17 @@ def cmd_init(a) -> None:
 
 
 def cmd_issue(a) -> None:
+    # --claims is for claims of your own. Like scope or exp, it cannot replace what a flag already set.
+    clash = sorted({"clearance", "role", "role_exp"} & set(json.loads(a.claims)))
+    if clash:
+        msg = f"--claims would replace {clash}; use --clearance, --role and --role-ttl"
+        raise ValueError(msg)
+    if a.role_ttl is not None and not a.role:
+        msg = "--role-ttl needs --role: there is no role to end"
+        raise ValueError(msg)
+    role = {"role": a.role} if a.role else {}
+    if a.role_ttl is not None:
+        role["role_exp"] = int(time.time()) + a.role_ttl
     token, idx = issue_mandate(
         a.state,
         load_agent_pub(a.agent_key),
@@ -180,7 +191,7 @@ def cmd_issue(a) -> None:
         purpose=a.purpose,
         principal=a.principal,
         org=a.org,
-        extra={"clearance": a.clearance, **({"role": a.role} if a.role else {}), **json.loads(a.claims)},
+        extra={"clearance": a.clearance, **role, **json.loads(a.claims)},
     )
     if a.out:
         a.out.write_text(token)
@@ -269,13 +280,19 @@ def main(argv: list[str] | None = None) -> None:
         "--role",
         help="a role the person holds, signed in for the agent; level 4 also needs a role the gateway lists",
     )
+    s.add_argument(
+        "--role-ttl",
+        type=int,
+        help="seconds until the person stops holding the role; level 4 closes then and the rest of the mandate "
+        "keeps working (default: the role lasts as long as the mandate)",
+    )
     s.add_argument("--scope", default=json.dumps(DEFAULT_SCOPE), help="what the agent may do (JSON)")
     s.add_argument("--deny", default=json.dumps(DEFAULT_DENY), help="what it must never do (JSON)")
     s.add_argument("--ttl", type=int, default=7200, help="seconds until it expires")
     s.add_argument("--purpose", default="Pupil-data lookups for school SCH01", help="why the agent needs it")
     s.add_argument("--principal", default="officer:jsmith", help="the person handing over access")
     s.add_argument("--org", default="school:SCH01", help="who that person acts for")
-    s.add_argument("--claims", default="{}", help="claims of your own to sign in, e.g. '{\"clearance\": 2}' (JSON)")
+    s.add_argument("--claims", default="{}", help="claims of your own to sign in, e.g. '{\"max_limit\": 20}' (JSON)")
     s.add_argument("-o", "--out", type=Path, help="file to write to (default: print it)")
     s.set_defaults(fn=cmd_issue)
 

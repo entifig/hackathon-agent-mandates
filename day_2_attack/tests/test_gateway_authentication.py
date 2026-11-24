@@ -10,7 +10,8 @@ from fastmcp import FastMCP
 
 from gateway import cli, main
 from gateway.lib.common import b64u, generate_keypair, priv_from_pem, priv_to_pem, sign_bytes
-from gateway.lib.gateway_verify import Request
+from gateway.lib.gateway_verify import Gateway, Request
+from mcp_server.api.routes_mcp import aggregate as census_aggregate
 
 
 @pytest.fixture
@@ -47,6 +48,11 @@ def isolated_gateway(tmp_path, monkeypatch):
         if (query, urn) == ("P0011", "SCH04"):
             return [{"Psuedo ID": "P0011", "URN": "SCH04", "Ethnicity": "ASIA"}]
         return []
+
+    @upstream.tool
+    def aggregate(table: str, group_by: list[str], measure: str, where: dict[str, str]) -> list[dict]:
+        upstream_calls.append(("aggregate", table, tuple(group_by)))
+        return census_aggregate(table, group_by, measure, where)
 
     monkeypatch.setattr(main, "STATE_DIR", state)
     monkeypatch.setattr(main, "state", {})
@@ -140,22 +146,19 @@ def test_discovery_responses_keep_issuer_private_key_private(isolated_gateway, p
     assert b64u(issuer.private_bytes_raw()) not in response.text
 
 
-def test_public_demo_routes_can_mint_and_use_an_out_of_scope_mandate(isolated_gateway):
+def test_public_demo_routes_cannot_mint_or_use_an_out_of_scope_mandate(isolated_gateway):
+    # This was the finding: /demo/mandate signed a SCH04 mandate for anyone and /demo/call returned the flag row.
+    # The gateway now mounts those routes only with GATEWAY_DEMO=1, so the default gateway refuses each step.
     client, _, _, _, _, _, calls = isolated_gateway
     issued = client.post("/demo/mandate", json={"urn": "SCH04", "tools": ["search"], "clearance": 4})
-    assert issued.status_code == 200
-    assert issued.json()["claims"]["scope"][0]["constraints"]["urn"] == ["SCH04"]
+    assert issued.status_code in (401, 403, 404)
     response = client.post(
         "/demo/call",
         json={"tool": "search", "arguments": {"query": "P0011", "urn": "SCH04"}},
     )
-    assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == 200
-    assert body["response"]["decision"]["decision"] == "ALLOW"
-    assert body["response"]["result"] == [{"Psuedo ID": "P0011", "URN": "SCH04", "Ethnicity": "ASIA"}]
-    assert ("search", "P0011", "SCH04") in calls
-    assert issued.status_code in (401, 403, 404)
+    assert response.status_code in (401, 403, 404)
+    assert client.post("/demo/revoke", json={"idx": 0}).status_code in (401, 403, 404)
+    assert ("search", "P0011", "SCH04") not in calls
 
 
 @pytest.mark.parametrize("mandate", ["", "not-a-jwt", "a.b.c"])
@@ -177,4 +180,49 @@ def test_replayed_request_is_denied_after_gateway_state_reload(isolated_gateway)
     main.load_state(state)
     replay = client.post("/tools/call", json=body)
     assert (replay.status_code, replay.json()["decision"]["reason_code"]) == (403, "POP_FAILED")
+    assert len(calls) == baseline
+
+
+def test_rounded_aggregate_suppresses_one_pupil_care_group(isolated_gateway):
+    client, state, agent, _, _, _, _ = isolated_gateway
+    table = "personal_data_school_census"
+    token, _ = cli.issue_mandate(
+        state,
+        agent.public_key(),
+        scope=[{"server": "pupil-data", "tools": ["aggregate"], "constraints": {"table": [table]}}],
+        deny=cli.DEFAULT_DENY,
+        ttl=3600,
+        purpose="school-wide counts",
+        principal="eval:fixture",
+        org="school:SCH07",
+        extra={"clearance": 4, "role": "safeguarding-lead"},
+    )
+    arguments = {
+        "table": table,
+        "group_by": ["URN", "InCareAtCurrentSchool"],
+        "measure": "FSMeligible",
+        "where": {"URN": "SCH07"},
+    }
+    raw = census_aggregate(**arguments)
+    assert next(row["total"] for row in raw if row["InCareAtCurrentSchool"] == "1") == 5
+    body = cli.sign_request(agent, server="pupil-data", tool="aggregate", arguments=arguments, mandate=token)
+    response = client.post("/tools/call", json=body)
+    assert response.status_code == 200
+    assert response.json()["decision"]["decision"] == "ALLOW"
+    assert not any(row["InCareAtCurrentSchool"] == "1" for row in response.json()["result"])
+
+
+def test_replayed_request_is_denied_by_a_second_live_gateway_instance(isolated_gateway):
+    client, state, agent, token, _, _, calls = isolated_gateway
+    uri = main.state["status_uri"]
+    second = Gateway(
+        main.state["gateway"].registry,
+        status_lists={uri: (state / "status_list.jwt").read_text().strip()},
+        nonce_log=state / "seen_nonces.log",
+    )
+    body = signed_get(agent, token)
+    assert client.post("/tools/call", json=body).status_code == 200
+    baseline = len(calls)
+    decision = second.decide(Request(**body))
+    assert (decision.decision, decision.reason_code) == ("DENY", "POP_FAILED")
     assert len(calls) == baseline

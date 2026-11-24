@@ -61,6 +61,11 @@ What we want at the end is what you found out: where agent mandates hold and whe
 4. Read [gateway/lib/gateway_verify.py](gateway/lib/gateway_verify.py). It walks through the current verification process.
 
 Ports: MCP server `:8080`, gateway `:8082`, question board `127.0.0.1:8090` (loopback only — it also serves the Day 2 attack lab at `127.0.0.1:8090/attack`, which mints with your issuer key, so it is never exposed off the host), demo UI `localhost:8081/demo` (a walkthrough of issuing a mandate and making a call - feel free to extend, e.g - for human in the loop escalation.). `make hack` and `make run` start all four.
+
+The demo UI issues, revokes and calls through the gateway's `/demo/mandate`, `/demo/revoke` and `/demo/call`. Those
+routes sign with the issuer key for whoever asks, so the gateway mounts them only when `GATEWAY_DEMO=1` (put that
+line in `.env`, then `make run`). Leave it off on a gateway you post for Day 2: with it on, anyone can mint a mandate for
+any school and call with it. The question board needs none of them.
 `make test` and `make lint` run the tests and ruff. The data sources are listed in
 [mcp_server/data/synthetic/synthetic_manifest.json](mcp_server/data/synthetic/synthetic_manifest.json).
 
@@ -157,6 +162,12 @@ The gateway sees each tool as `pupil-data.<tool>`.
 | `clearance` | `4` | Required. A result above it is refused |
 | `role` | `safeguarding-lead` | Required as well when the result is level 4. `make eval_build` puts it on every eval mandate |
 
+**The eval passes only with an eval pack minted from this repo.** Our gateway answers `CLEARANCE_MISSING` to every
+mandate that has no `clearance` claim, question 0 included, and `ROLE_REQUIRED` to census rows without a listed
+role. `make eval_build` here signs both into the pack. A pack minted from the starter repo has neither, so every
+case that expects `ALLOW` would fail against this gateway. This is deliberate: a mandate that does not say how
+sensitive the data may be gets nothing.
+
 Question 5 also uses `eval_pack/two_schools.jwt`, the same mandate with `search` scoped to `SCH01` and `SCH02` as
 two separate entries.
 
@@ -177,7 +188,10 @@ Each answer is `200 ALLOW`, `202 STEP_UP` (held for approval, not forwarded) or 
 | `SIG_INVALID` | The mandate's issuer signature does not match its payload, e.g. after editing it |
 | `EXPIRED` / `REVOKED` | Out of date, or its index is set in the status list |
 | `WRONG_TOKEN_TYPE` / `ISSUER_NOT_ACCREDITED` / `NOT_YET_VALID` / `STATUS_UNAVAILABLE` | Not a mandate, an issuer not in `trusted_list.json`, `nbf` in the future, or the status list cannot be read |
-| `POP_FAILED` | The request was not signed by the mandate's key, or its nonce has been seen before |
+| `MANDATE_MALFORMED` / `REQUEST_MALFORMED` | The mandate does not parse as a JWT with a string `iss`, or the request holds text that cannot be hashed. A denial, never an error page |
+| `POP_FAILED` | The request was not signed by the mandate's key, or its nonce has been seen before. Accepted nonces are kept in `gateway/state/seen_nonces.log`, so a restart does not let a request through twice |
+| `CLEARANCE_MISSING` / `CLEARANCE_INVALID` / `CLEARANCE_TOO_LOW` | The mandate has no `clearance`, one outside 1 to 4, or one below the labels on what the call can return |
+| `ROLE_REQUIRED` / `ROLE_EXPIRED` / `ROLE_INVALID` | Level 4 data without a role the gateway lists, after the mandate's `role_exp`, or a `role` or `role_exp` that is not a name and a time |
 | `DENIED_BY_RULE` | The tool matches a `deny` glob. Checked before scope |
 | `OUT_OF_SCOPE` | No scope entry lists the tool |
 | `CONSTRAINT_MISSING` / `CONSTRAINT_VIOLATED` | A constrained argument is absent, or its value is not in the allowed list |
@@ -235,6 +249,12 @@ mandate back. Never copy `issuer_key.pem`.
 uv run python -m gateway.cli keygen -o key.pem > public_key.jwk               # you: send public_key.jwk
 uv run python -m gateway.cli issue --agent-key public_key.jwk --clearance 4 --role safeguarding-lead -o mandate.jwt  # them: send mandate.jwt back
 ```
+
+`--clearance` is required: 1 public to 4 special category. Census rows are level 4, and level 4 also needs
+`--role safeguarding-lead` (or another role in the gateway's `GATEWAY_PRIVATE_ROLES`). Give a teammate the lowest
+clearance that does the job. If the person holds the role for less time than the mandate lasts, add
+`--role-ttl <seconds>`: it signs a `role_exp`, after which level 4 is `ROLE_EXPIRED` and the rest of the mandate
+keeps working. A role withdrawn earlier than planned still needs the mandate revoked.
 
 Then call as below with `--mandate mandate.jwt --agent-key key.pem --url <their gateway>`.
 

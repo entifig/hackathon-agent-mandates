@@ -13,6 +13,9 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev --no-install-project --extra gateway
 
 COPY gateway gateway
+# The gateway refuses to start without the sensitivity labels. docker-compose mounts the live manifest over this
+# copy (CLASSIFICATION_MANIFEST); a deployment that runs the image alone reads this one.
+COPY mcp_server/data/synthetic/synthetic_manifest.json gateway/manifest.json
 
 RUN useradd --create-home --shell /bin/bash appuser \
     && chown -R appuser:appuser /app

@@ -1,7 +1,11 @@
 """Routes behind the frontend demo page, one per step.
 
 The demo keeps the agent's private key on the gateway, so the browser needs no crypto.
-shortcut: a real agent holds its own key; this is for teaching only, never deploy the demo router publicly.
+shortcut: a real agent holds its own key; this is for teaching only.
+
+Two routers. `router` only reads what is public anyway (the issuer's public key, the trusted and status lists) and
+is always mounted. `admin_router` signs mandates, revokes them and signs calls for whoever asks, with no check on
+who that is. main.py mounts it only when GATEWAY_DEMO=1: never set that on a gateway other people can reach.
 """
 
 import json
@@ -15,6 +19,7 @@ from gateway.cli import issue_mandate, load_or_create_key, revoke_mandate, sign_
 from gateway.lib.gateway_verify import Request
 
 router = APIRouter(prefix="/demo", tags=["demo"])
+admin_router = APIRouter(prefix="/demo", tags=["demo"])
 
 
 def _gw():
@@ -77,7 +82,7 @@ def demo_issuer():
     }
 
 
-@router.post("/mandate")
+@admin_router.post("/mandate")
 def demo_mandate(body: MandateBody):
     """Write a mandate: a signed note that hands part of a person's access to one agent."""
     state_dir = _gw().state["dir"]
@@ -135,14 +140,14 @@ def demo_trust():
     return _trust_view()
 
 
-@router.post("/revoke")
+@admin_router.post("/revoke")
 def demo_revoke(body: RevokeBody):
     """Cancel a mandate by the number it was given when issued."""
     revoke_mandate(_gw().state["dir"], body.idx)
     return _trust_view()
 
 
-@router.post("/call")
+@admin_router.post("/call")
 async def demo_call(body: CallDemoBody):
     """Sign a call with the agent's key and send it through the real gateway checks."""
     gw = _gw()
