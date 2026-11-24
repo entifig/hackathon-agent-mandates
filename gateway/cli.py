@@ -9,6 +9,7 @@ never do, and until when. The gateway checks the note on every call. The issuer 
     python -m gateway.cli discover --url http://localhost:8082      # agent: see what a gateway offers
     python -m gateway.cli revoke --idx 0                            # issuer: cancel mandate 0
     python -m gateway.cli decode mandate.jwt                        # anyone: read what a mandate says
+    python -m gateway.cli audit --pupil P0011                       # operator: who was sent this pupil's data?
     python -m gateway.cli call --mandate gateway/state/mandate.jwt --agent-key gateway/state/agent.pem \\
         --server pupil-data --tool search --args '{"query": "P0004", "urn": "SCH01"}'
 
@@ -24,6 +25,7 @@ import time
 import urllib.request
 from pathlib import Path
 
+from gateway.lib import audit
 from gateway.lib.common import (
     b64u,
     b64u_decode,
@@ -232,6 +234,63 @@ def cmd_call(a) -> None:
     print(json.dumps(json.loads(text), indent=2))
 
 
+def _audit_line(e: dict) -> str:
+    d, m, r = e.get("decision") or {}, e.get("mandate") or {}, e.get("released") or {}
+    args = json.dumps(e.get("arguments"), ensure_ascii=False, separators=(",", ":"))
+    line = (
+        f"#{e.get('seq')} {e.get('at')} {d.get('decision')} {d.get('reason_code')}"
+        f"{'' if m.get('verified') else ' UNVERIFIED'} {m.get('principal')}"
+        f" jti={m.get('jti')} idx={m.get('status_idx')}"
+        f" jkt={(m.get('jkt') or '')[:10]} from={(e.get('client') or {}).get('addr')}"
+        f" {e.get('server')}.{e.get('tool')} {args} -> {e.get('status')}"
+    )
+    if r:
+        line += f" rows={r.get('rows')} pupils={','.join(r.get('pupils', [])) or '-'}"
+    return line
+
+
+def cmd_audit(a) -> None:
+    path = a.file or audit.log_path(a.state)
+    if a.verify:
+        chain = audit.verify_chain(path)
+        if chain["ok"]:
+            print(f"chain OK: {chain['entries']} entries, head {chain['head']}")
+        else:
+            print(f"chain BROKEN at line {chain['broken_at']}: {chain['reason']}")
+            sys.exit(1)
+        return
+    entries = audit.select(
+        audit.read_entries(path),
+        principal=a.principal,
+        jti=a.jti,
+        pupil=a.pupil,
+        decision=a.decision,
+        since=a.since,
+        limit=a.limit,
+    )
+    if a.plain:
+        print("\n".join(audit.overview(entries, subject="the matching mandates")))
+    for e in entries:
+        print(json.dumps(e) if a.json else audit.plain(e) if a.plain else _audit_line(e))
+    print(f"{len(entries)} matching entries in {path}", file=sys.stderr)
+
+
+def add_audit_parser(sub) -> None:
+    s = sub.add_parser("audit", help="read the gateway's audit log: who asked for what, and whose data was sent")
+    s.add_argument("--state", type=Path, default=argparse.SUPPRESS, help="as above; may also follow `audit`")
+    s.add_argument("--file", type=Path, help="log file (default: audit.jsonl in --state); e.g. a copy from a server")
+    s.add_argument("--principal", help="only mandates granted by this person, e.g. officer:jsmith")
+    s.add_argument("--jti", help="only this mandate")
+    s.add_argument("--pupil", help="only calls that sent this pupil's data or named them, e.g. P0011")
+    s.add_argument("--decision", choices=["ALLOW", "DENY", "STEP_UP", "ERROR"], help="only this decision")
+    s.add_argument("--since", help="only entries at or after this time (ISO 8601 or unix seconds)")
+    s.add_argument("--limit", type=int, help="only the last N matching entries")
+    s.add_argument("--plain", action="store_true", help="plain-English lines, with an overview first")
+    s.add_argument("--json", action="store_true", help="full entries as JSON lines")
+    s.add_argument("--verify", action="store_true", help="check the hash chain and report the first broken link")
+    s.set_defaults(fn=cmd_audit)
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument(
@@ -284,6 +343,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--args", default="{}", help="tool arguments (JSON)")
     s.add_argument("--url", default="http://localhost:8082", help="gateway address")
     s.set_defaults(fn=cmd_call)
+
+    add_audit_parser(sub)
 
     a = p.parse_args(argv)
     a.fn(a)

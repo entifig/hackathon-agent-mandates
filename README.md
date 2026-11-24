@@ -196,6 +196,42 @@ The gateway reads the status list on every request, so a revocation applies with
 To make a mandate say something new, such as a clearance or a limit, see [docs/new_mandate.md](docs/new_mandate.md):
 `cli issue --claims` signs a claim of your own into the mandate, and the page shows where the gateway reads it.
 
+## The request log (questions 14 and 16)
+
+The gateway records every decision in `gateway/state/audit.jsonl`, or in the file named by `GATEWAY_AUDIT_LOG`. That
+includes `ALLOW`, `DENY`, `STEP_UP`, `AUDIT_UNAVAILABLE` and requests whose mandate did not verify. One JSON line per
+request holds:
+
+- the decision;
+- the mandate's `jti`, issuer, principal and agent key, with `"verified": false` if it did not check out;
+- the source address, server, tool and arguments;
+- for an answered call, a summary of what was sent: rows, columns, pupil IDs and school codes. Row values are never
+  stored.
+
+Each line is hash-chained to the one before it and fsync'd before the response goes out. The code is in
+[gateway/lib/audit.py](gateway/lib/audit.py).
+
+- **If the log can't be written, nothing is sent.** Each call gets `403 AUDIT_UNAVAILABLE`. A gateway that starts
+  with an unwritable state directory returns `503` from `/healthcheck`, with the reason.
+- **The operator** (whoever has the state directory) reads it with the CLI:
+
+  ```bash
+  uv run python -m gateway.cli audit --pupil P0011             # every request that sent or named this pupil
+  uv run python -m gateway.cli audit --principal officer:jsmith --decision DENY --plain
+  uv run python -m gateway.cli audit --verify                  # chain OK, or the first line that was edited or removed
+  uv run python -m gateway.cli audit --file copy.jsonl --jti urn:uuid:...   # a copy taken off the gateway
+  ```
+
+- **The person who granted a mandate** reads their own entries through the gateway with `server: "gateway"`,
+  `tool: "audit"`. This needs a mandate whose scope pins their principal:
+  `{"server": "gateway", "tools": ["audit"], "constraints": {"principal": ["officer:jsmith"]}}`. They pass
+  `arguments.principal`, with `jti`, `since` and `limit` as optional arguments. They get back the entries, a summary
+  in plain English and the chain head. Asking for another principal returns `CONSTRAINT_VIOLATED`. An agent's
+  pupil-data mandate has no `gateway` scope, so it returns `OUT_OF_SCOPE`. Both refusals are logged too. A
+  walkthrough is in [questions/16-request-log.md](questions/16-request-log.md#what-we-did).
+
+The log holds pupil IDs and search terms, so treat it as pupil data. Do not commit or post it.
+
 ## Sending requests
 
 Locally, `make hack` creates a key (`gateway/state/agent.pem`) and a starting mandate for it

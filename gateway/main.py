@@ -17,6 +17,7 @@ from fastmcp.exceptions import ToolError
 from pydantic import BaseModel
 
 from gateway.cli import sign_request
+from gateway.lib import audit  # AUDIT(q14/q16)
 from gateway.lib.common import generate_keypair, pub_to_jwk
 from gateway.lib.gateway_verify import Gateway, Request
 from gateway.lib.trust_registry import TrustedList
@@ -50,14 +51,18 @@ def load_state(state_dir: Path) -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     load_state(STATE_DIR)
+    state["audit_error"] = audit.startup_check(STATE_DIR)  # AUDIT(q14/q16): unwritable log -> /healthcheck 503
     yield
 
 
 app = FastAPI(title="mandate gateway", lifespan=lifespan)
+app.add_middleware(audit.ClientAddress)  # AUDIT(q14/q16): source address for the audit entry
 
 
 @app.get("/healthcheck")
-def healthcheck() -> dict:
+def healthcheck():
+    if state.get("audit_error"):  # AUDIT(q14/q16): fail visibly, the gateway would deny every call
+        return JSONResponse({"status": "error", "reason": state["audit_error"]}, status_code=503)
     return {"status": "ok"}
 
 
@@ -98,6 +103,7 @@ async def describe() -> dict:
 
 
 @app.post("/tools/call")
+@audit.audited(state)  # AUDIT(q14/q16): answers gateway.audit, logs every call before its response goes out
 async def tools_call(body: CallBody):
     gateway: Gateway = state["gateway"]
     # re-read the published status list each request so `cli revoke` applies without a restart
@@ -105,7 +111,7 @@ async def tools_call(body: CallBody):
 
     decision = gateway.decide(Request(**body.model_dump()))
     record = decision.to_dict()
-    # no audit trail: teams write their own decision record here (e.g. state["dir"] / "audit.jsonl")
+    # audit trail: written by @audit.audited (gateway/lib/audit.py) after this returns, before the response
 
     if decision.decision == "DENY":
         return JSONResponse({"decision": record}, status_code=403)

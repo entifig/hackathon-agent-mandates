@@ -113,7 +113,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Allowed tool names; '*' not permitted"
+            "description": "Allowed tool names; '*' not permitted. server \"gateway\" with tool \"audit\" is answered by the gateway itself (the request log); grant it only with constraints.principal pinned to the reader's own principal"
           },
           "constraints": {
             "type": "object",
