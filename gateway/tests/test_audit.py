@@ -197,6 +197,20 @@ def test_unconstrained_audit_grant_is_refused(gw, tmp_path):
     assert "result" not in r.json()
 
 
+def test_audit_requires_a_matching_pinned_grant(gw, tmp_path):
+    client, call, state = gw
+    call(client, "search", query=ev.PUPIL, urn="SCH01")
+    logged_jti = entries(state)[0]["mandate"]["jti"]
+    scope = [
+        {"server": "gateway", "tools": ["audit"], "constraints": {"principal": [PERSON], "jti": ["allowed"]}},
+        {"server": "gateway", "tools": ["audit"]},
+    ]
+    key, token = person_mandate(state, tmp_path, scope=scope)
+    r = call(client, "audit", server="gateway", key=key, token=token, principal=PERSON, jti=logged_jti)
+    assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "CONSTRAINT_VIOLATED")
+    assert "result" not in r.json()
+
+
 def test_cli_finds_flag_pupil(gw, capsys):
     client, call, state = gw
     call(client, "search", query="P0006", urn="SCH01")

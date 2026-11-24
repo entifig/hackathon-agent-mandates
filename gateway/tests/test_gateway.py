@@ -17,6 +17,7 @@ from gateway.lib.budget import parse_budget, pupil_ids
 from gateway.lib.common import generate_keypair, priv_from_pem, priv_to_pem, sign_bytes
 from gateway.lib.gateway_verify import Request, check_request
 from gateway.lib.nonce_store import TS_WINDOW, NonceStore
+from mcp_server.api import routes_mcp
 from mcp_server.api.routes_mcp import mcp
 
 
@@ -390,6 +391,18 @@ def test_budgeted_search_takes_one_pupil_id_only(issue, forwarded, query):
     assert status == 403
     assert code in {"BUDGET_QUERY", "TOO_MUCH"}  # "" is already refused by the starter's empty-query rule
     assert forwarded == []
+
+
+@pytest.mark.parametrize(("limit", "query"), [(1, "P1022"), (2, "P1022")])
+def test_budgeted_search_releases_only_the_exact_pupil(issue, monkeypatch, tmp_path, limit, query):
+    call = issue(budget={"pupils": limit})
+    # Exercise the real MCP substring search with two IDs that share a prefix.
+    monkeypatch.setattr(routes_mcp, "SYNTH_ROOT", tmp_path)
+    (tmp_path / "synthetic_personal_data_school_census.csv").write_text("Psuedo ID,URN\nP1022,SCH05\nP10220,SCH05\n")
+    r = call("search", query=query, urn=ELMWOOD)
+    assert r.status_code == 200, r.text
+    assert r.json()["result"] == [{"Psuedo ID": "P1022", "URN": ELMWOOD}]
+    assert used(r) == (1, 1)
 
 
 def test_budgeted_mandate_cannot_use_aggregate(issue, forwarded):

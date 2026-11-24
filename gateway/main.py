@@ -239,6 +239,16 @@ async def _forward_budgeted(target, body: CallBody, decision: Decision, budget: 
         return refuse(*refusal)
 
     ok, payload = await call_upstream(target, body)
+    if ok and body.tool == "search":
+        if not isinstance(payload, list):
+            return refuse("BUDGET_RESULT", "search result could not be checked")
+        # upstream search is a substring match: release only the rows of the one pupil named (and charged)
+        named = body.arguments["query"].upper()
+        payload = [
+            row
+            for row in payload
+            if isinstance(row, dict) and str(row.get("Psuedo ID", "")).upper() == named and pupil_ids(row) <= {named}
+        ]
     # backstop for tools that list pupils without naming them (roster, get). An upstream error is upstream data too.
     returned = pupil_ids(payload)
     if not ledger.fits(budget, returned):

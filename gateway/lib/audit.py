@@ -50,7 +50,7 @@ from fastapi import HTTPException
 from fastapi.responses import JSONResponse, Response
 
 from .common import canonical, jwk_thumbprint, pub_to_pem, sha256_hex
-from .gateway_verify import MAX_ROWS, POLICY_VERSION, Request
+from .gateway_verify import MAX_ROWS, POLICY_VERSION, Request, check_request
 
 try:  # Unix: lock the file so two gateway processes sharing a state dir do not fork the chain
     import fcntl
@@ -480,16 +480,22 @@ def _deny(record: dict, code: str, detail: str) -> JSONResponse:
                         status_code=403)
 
 
-def _principal_granted(claims: dict | None, principal) -> bool:
+def _principal_granted(claims: dict | None, request: Request) -> tuple[bool, str]:
     """Belt and braces after the ordinary scope check: the grant must name gateway.audit exactly and pin
-    `principal`, so an unconstrained gateway.audit entry cannot read everyone's log."""
-    for entry in (claims or {}).get("scope", []):
-        if not isinstance(entry, dict) or entry.get("server") != SERVER or TOOL not in entry.get("tools", []):
-            continue
-        allowed = (entry.get("constraints") or {}).get("principal")
-        if isinstance(allowed, list) and isinstance(principal, str) and principal in allowed:
-            return True
-    return False
+    `principal`, and that same grant must satisfy every other constraint on the request."""
+    pinned = [
+        entry
+        for entry in (claims or {}).get("scope") or []
+        if isinstance(entry, dict)
+        and entry.get("server") == SERVER
+        and TOOL in (entry.get("tools") or [])
+        and isinstance(entry.get("constraints"), dict)
+        and isinstance(entry["constraints"].get("principal"), list)
+    ]
+    if not pinned or not isinstance(request.arguments.get("principal"), str):
+        return False, "CONSTRAINT_MISSING"
+    decision, code, _ = check_request(request, pinned, [], [])
+    return decision == "ALLOW", code
 
 
 def serve_audit(state: dict, body) -> Response | dict:
@@ -506,8 +512,9 @@ def serve_audit(state: dict, body) -> Response | dict:
         return _deny(record, "OUT_OF_SCOPE", f"{body.server}.{body.tool}")
     args = body.arguments
     _, claims = mandate_facts(body.mandate, gateway.registry)
-    if not _principal_granted(claims, args.get("principal")):
-        return _deny(record, "CONSTRAINT_MISSING", "principal: a gateway.audit grant must pin the principal")
+    granted, code = _principal_granted(claims, Request(**body.model_dump()))
+    if not granted:
+        return _deny(record, code, "a matching gateway.audit grant must pin the principal")
     try:
         since = _since(args.get("since"))
     except ValueError:
