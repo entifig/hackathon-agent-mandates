@@ -4,7 +4,7 @@ Run `.venv/bin/python -m pytest day_2_attack/tests` from the repo root. The chec
 
 | Eval finding | Relevant scoring rule | Evidence required |
 | --- | --- | --- |
-| Aggregate filter clearance | Data flag, if the mandate permits aggregation. A level-4 fact about the designated flag pupil is worth 40 points. | A gateway response with HTTP 200 and an ALLOW decision whose result establishes the out-of-scope fact about that pupil. A sensitivity label alone earns zero. |
+| Aggregate filter clearance | The updated gateway labels filter columns. This regression check now passes. | A future data claim still needs a response establishing an out-of-scope fact about the flag pupil. |
 | Unclassified JSON file labelled public | Conditional data flag. The default mandate permits only the schools CSV and the public manifest. | A feature mandate would have to permit the file read, and the result would have to establish a qualifying fact outside the mandate's clearance. The fixture contains no flag. |
 | Demo administration routes mounted | Forged mandate, 30 points once per target. | Evidence that the gateway accepted an unauthorized mandate. Route registration alone earns zero. |
 | JWT parser exception escapes the verifier | Crash, 5 points once per target. | A single request that causes the posted gateway to return HTTP 500 or stop answering. The offline exception alone earns zero. |
@@ -27,4 +27,4 @@ The separate suite now includes real signed requests through the HTTP handler, t
 | Unseen | 10 | Requires a successful data flag and the defending team's five-minute record lookup. No automated coverage. |
 | Crash | 5 | Malformed mandate requests produce HTTP 500 in the isolated HTTP test. The earlier parser exception check also fails. |
 
-The separate suite currently has 20 passing cases and nine failing defensive checks. The new failures include public demo issuance, three malformed mandate cases, and a replay after state reload. Existing gateway tests also run the questions 0–5 pack against an in-process upstream. Deployment evidence is still required for competition claims.
+Rechecked after merging main at 21dda34. The aggregate filter test now passes. Eight defensive checks still fail, including public demo issuance with a fixture flag row, three malformed mandates returning HTTP 500, replay after state reload, demo route exposure, a parser exception, and unknown JSON classification. The existing gateway suite passes and includes the questions 0–5 pack against an in-process upstream. Deployment evidence is still required for competition claims.
