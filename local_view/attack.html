@@ -145,6 +145,47 @@
   .kv td { padding: 8px 0; word-break: break-all; }
   .result-box { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; background: #fcfbf9; }
 
+  /* filter bar */
+  .filters { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .filters select, .filters input { font: inherit; border: 1px solid var(--line); border-radius: 8px; padding: 6px 9px; background: var(--card); color: var(--ink); }
+  .filters input[type=search] { min-width: 180px; }
+
+  /* expandable finding rows */
+  tr.frow { cursor: pointer; }
+  tr.frow:hover td { background: var(--soft); }
+  tr.frow.open td { background: #f1efe9; }
+  .caret { display: inline-block; width: 12px; color: var(--muted); transition: transform .12s; font-size: 11px; }
+  tr.frow.open .caret { transform: rotate(90deg); }
+  tr.fdetail > td { padding: 0; border-bottom: 1px solid var(--line); background: #fbfaf7; }
+  .drill { display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); gap: 16px; padding: 16px 18px; }
+  .drill .col { display: grid; gap: 14px; align-content: start; }
+  .panel h4 { margin-bottom: 6px; }
+  .panel pre { background: var(--soft); border: 1px solid var(--line); border-radius: 8px; padding: 10px; font-family: var(--mono); font-size: 11.5px; overflow-x: auto; margin: 4px 0 0; max-height: 300px; }
+  @media (max-width: 1000px) { .drill { grid-template-columns: minmax(0, 1fr); } }
+
+  /* why-it-held/broke pipeline */
+  .pipe { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 0; }
+  .pstage { display: grid; grid-template-columns: 22px 1fr; gap: 8px; padding: 7px 0; border-top: 1px solid var(--line); }
+  .pstage:first-child { border-top: 0; }
+  .pstage .pi { width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center; font-size: 12px; font-weight: 700; }
+  .pi.pass { background: var(--allow-bg); color: var(--allow); }
+  .pi.stop { background: var(--deny-bg); color: var(--deny); }
+  .pi.held { background: var(--hold-bg); color: var(--hold); }
+  .pi.skip { background: var(--soft); color: var(--muted); }
+  .pstage .pt { font-weight: 600; font-size: 13px; }
+  .pstage.is-stop .pt { color: var(--deny); }
+  .pstage .px { font-size: 12px; color: var(--muted); }
+  .pstage .pcode { display: inline-block; font-family: var(--mono); font-size: 11px; border-radius: 5px; padding: 0 6px; margin-left: 6px; background: var(--deny-bg); color: var(--deny); }
+  .pstage.is-allow .pcode { background: var(--allow-bg); color: var(--allow); }
+  .pstage.is-held .pcode { background: var(--hold-bg); color: var(--hold); }
+  .pstage.skip .pt { color: var(--muted); font-weight: 500; }
+
+  /* collapsible vector groups */
+  .vgroup-head { cursor: pointer; }
+  .vgroup-head .vcaret { color: var(--muted); font-size: 11px; transition: transform .12s; }
+  .vgroup.collapsed .vcaret { transform: rotate(-90deg); }
+  .vgroup.collapsed .vbody { display: none; }
+
   @media (max-width: 1100px) {
     .compose, .form-grid { grid-template-columns: minmax(0, 1fr); }
     table.findings, table.findings tbody, table.findings tr, table.findings td { display: block; width: 100%; }
@@ -152,6 +193,8 @@
     table.findings tr { border-bottom: 1px solid var(--line); }
     table.findings td { border: 0; padding: 6px 12px; }
     table.findings td::before { content: attr(data-label); display: block; font-size: 11px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); margin-bottom: 2px; }
+    tr.fdetail td::before { content: none; }
+    .drill { padding: 12px; }
   }
 </style>
 </head>
@@ -180,11 +223,23 @@
     <div class="card-head">
       <h2>Findings</h2>
       <div class="row-actions">
+        <div class="filters">
+          <select id="f-outcome">
+            <option value="all">All outcomes</option>
+            <option value="bad">Needs attention</option>
+            <option value="ok">Held / safe</option>
+            <option value="warn">Odd</option>
+            <option value="flat">No answer</option>
+          </select>
+          <input id="f-text" type="search" placeholder="filter by id, title, code…">
+        </div>
         <span class="muted small" id="findings-note">Run a vector to add a row.</span>
+        <button type="button" id="expand-all">Expand all</button>
         <button type="button" id="export">Export JSON</button>
         <button type="button" id="clear">Clear</button>
       </div>
     </div>
+    <p class="muted small" style="margin:-4px 0 10px">Click any row to see the payload, the gateway's reply, and the exact stage that held or broke it.</p>
     <div class="scroll-x">
       <table class="findings">
         <thead><tr><th>Vector</th><th>Mandate</th><th>Request</th><th>Outcome</th><th>Level</th><th>Points</th><th>Detail</th></tr></thead>
@@ -196,7 +251,14 @@
   <section class="card">
     <div class="card-head">
       <h2>Vectors</h2>
-      <span class="muted small" id="vectors-note">Each vector mints or forges a mandate, calls a tool, and scores the answer.</span>
+      <div class="row-actions">
+        <span class="muted small" id="vectors-note">Each vector mints or forges a mandate, calls a tool, and scores the answer.</span>
+        <div class="filters">
+          <input id="v-text" type="search" placeholder="filter vectors…">
+          <button type="button" id="v-expand">Expand all</button>
+          <button type="button" id="v-collapse">Collapse all</button>
+        </div>
+      </div>
     </div>
     <div id="vectors"><p class="muted">Loading the catalog…</p></div>
   </section>
@@ -316,24 +378,63 @@
 </main>
 
 <script>
-const GROUP_ORDER = ["baseline", "data", "aggregate", "forged", "dead", "nokey", "bulk", "crash", "keys", "manual", "saved"];
+const GROUP_ORDER = ["baseline", "data", "scope", "clearance", "aggregate", "forged", "dead", "nokey", "bulk", "crash", "query", "path", "keys", "manual", "saved"];
 const GROUP_NAME = {
   baseline: "Baseline — should be allowed",
   data: "Data disclosure",
+  scope: "Out of scope — wrong tool or school",
+  clearance: "Clearance & role ladder",
   aggregate: "Aggregate leakage",
   forged: "Forged mandates",
   dead: "Dead mandates",
-  nokey: "No / bad key",
+  nokey: "No / bad key (proof of possession)",
   bulk: "Bulk export",
-  crash: "Crash the gateway",
+  crash: "Crash the gateway (malformed)",
+  query: "Query abuse",
+  path: "Path traversal",
   keys: "Key discovery",
   manual: "Manual",
   saved: "Saved",
 };
 const OUTCOME = {
-  LANDED: "bad", BROKE: "bad", "OVER-DENY": "warn", DATA: "bad",
+  // bad = a control failed; ok = a control worked (incl. permitted in-scope data); warn = odd; flat = no answer
+  LANDED: "bad", BROKE: "bad", "OVER-DENY": "warn", DATA: "ok",
   DENIED: "ok", HELD: "ok", OK: "ok", RAN: "flat", "NO ANSWER": "flat", ERROR: "warn",
 };
+const OUTCOME_WHY = {
+  LANDED: "The gateway allowed a request it should have stopped — data or a key escaped.",
+  BROKE: "The gateway threw instead of denying — an HTTP 500 is a crash, not a clean refusal.",
+  "OVER-DENY": "A request that should have been allowed was denied — too strict.",
+  DATA: "In-scope data came back exactly as the mandate permits — expected, scores nothing.",
+  DENIED: "Denied with a clean 403 and a reason code — the control worked.",
+  HELD: "Stopped before any protected data was returned — the control worked.",
+  OK: "Baseline request allowed as intended.",
+  RAN: "Ran and was allowed, but matched no rows to return.",
+  "NO ANSWER": "No response from the target (connection or route missing).",
+  ERROR: "The lab could not complete this vector.",
+};
+
+// The gateway pipeline, in order. Each finding's reason code names the stage that stopped it.
+const STAGES = [
+  {title: "Issuer accreditation", text: "The token must be a mandate+jwt signed by an accredited issuer.",
+   codes: ["WRONG_TOKEN_TYPE", "MANDATE_MALFORMED", "ISSUER_NOT_ACCREDITED", "SIG_INVALID"]},
+  {title: "Mandate validity", text: "nbf/exp within 30s skew, and the status bit not revoked.",
+   codes: ["NOT_YET_VALID", "EXPIRED", "REVOKED", "STATUS_UNAVAILABLE"]},
+  {title: "Proof of possession", text: "Request signed by the key in cnf.jwk, timestamp within 300s, nonce unseen.",
+   codes: ["REQUEST_MALFORMED", "POP_FAILED"]},
+  {title: "Clearance & role", text: "A clearance 1–4 must be present; a role, if given, must be a name with a valid expiry.",
+   codes: ["CLEARANCE_MISSING", "CLEARANCE_INVALID", "ROLE_INVALID"]},
+  {title: "Scope & rules", text: "Deny patterns, one matching scope entry, row limits, no empty search, no per-pupil aggregate.",
+   codes: ["DENIED_BY_RULE", "CONSTRAINT_MISSING", "CONSTRAINT_VIOLATED", "OUT_OF_SCOPE", "TOO_MUCH", "TOO_FINE", "STEP_UP"]},
+  {title: "Labels (sensitivity)", text: "Every column the tool can return is looked up; the top level must be within clearance, L4 needs a role.",
+   codes: ["CLEARANCE_TOO_LOW", "ROLE_REQUIRED", "ROLE_EXPIRED"]},
+  {title: "Data server", text: "Forwarded to the data server; the result is re-labelled before the agent sees it.",
+   codes: ["ALLOW"]},
+  {title: "Rounding", text: "Aggregate counts leave rounded to the nearest 10, so no group below 10 is released.", codes: []},
+];
+const STAGE_OF = {};
+STAGES.forEach((s, i) => s.codes.forEach((c) => { STAGE_OF[c] = i; }));
+const PICON = {pass: "✓", stop: "✕", held: "Ⅱ", skip: "·"};
 const TOOL_ARGS = {
   search: {urn: "SCH04", query: "Okafor"},
   get: {path: "data/personal_data_school_census.csv"},
@@ -345,7 +446,11 @@ const TOOL_ARGS = {
   write: {urn: "SCH04", pupil_id: "P0011", field: "Notes", value: "x"},
 };
 
-const state = {targets: [], vectors: [], findings: [], target: null};
+const state = {
+  targets: [], vectors: [], findings: [], target: null,
+  expanded: new Set(), fFilter: {outcome: "all", text: ""},
+  vText: "", vCollapsed: new Set(),
+};
 
 const $ = (id) => document.getElementById(id);
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
@@ -408,7 +513,8 @@ function renderChips() {
 
 function mandateCell(f) {
   const m = f.mandate_claims || {};
-  const scope = (m.scope || []).map((e) => (e.tools || []).join("/")).join(", ");
+  const scopeList = Array.isArray(m.scope) ? m.scope : [];
+  const scope = scopeList.map((e) => ((e && e.tools) || []).join("/")).join(", ");
   const bits = [];
   bits.push(clearanceTag(m.clearance));
   if (m.role) bits.push(`<code>${esc(m.role)}</code>`);
@@ -446,10 +552,97 @@ function detailCell(f) {
   return out.join("") || `<span class="muted">—</span>`;
 }
 
+/* which pipeline stage stopped this finding — the heart of "why it held or broke" */
+function stopIndex(f) {
+  if (f.reason && STAGE_OF[f.reason] != null) return STAGE_OF[f.reason];
+  if (f.got === "ALLOW") return STAGE_OF.ALLOW;
+  if (f.status === 500) return -2;       // crashed, stage unknown
+  if (!f.status) return -1;              // never answered
+  return -3;                             // allowed/denied without a mapped code
+}
+
+function pipeline(f) {
+  const stop = stopIndex(f);
+  const allow = f.got === "ALLOW";
+  if (stop === -1) return `<p class="muted small">The target never answered, so no stage ran.</p>`;
+  const rounded = allow && f.decided_by && (f.decided_by || []).includes("rounding");
+  const items = STAGES.map((s, i) => {
+    let icon = "skip", extra = "", klass = "skip";
+    if (stop === -2) {                   // crash: mark everything unknown
+      icon = "skip";
+    } else if (i < stop) {
+      icon = "pass"; klass = "pass";
+    } else if (i === stop) {
+      if (allow) { icon = "pass"; klass = "pass is-allow"; extra = `<span class="pcode">ALLOW</span>`; }
+      else if (f.got === "STEP_UP") { icon = "held"; klass = "held is-held is-stop"; extra = `<span class="pcode">${esc(f.reason || "STEP_UP")}</span>`; }
+      else { icon = "stop"; klass = "stop is-stop"; extra = `<span class="pcode">${esc(f.reason || "DENY")}</span>`; }
+    } else if (allow && s.title === "Rounding" && rounded) {
+      icon = "pass"; klass = "pass";
+    } else if (allow) {
+      icon = "pass"; klass = "pass";     // past the allow point data flowed through
+    }
+    const txt = i === stop && f.detail ? esc(f.detail) : esc(s.text);
+    return `<li class="pstage ${klass}"><span class="pi ${icon}">${PICON[icon]}</span>
+      <div><div class="pt">${esc(s.title)}${extra}</div><div class="px">${txt}</div></div></li>`;
+  }).join("");
+  return `<ul class="pipe">${items}</ul>`;
+}
+
+function detailPanels(f) {
+  const r = f.request || {};
+  const claims = f.mandate_claims || {};
+  const sent = {...r};
+  const respPretty = JSON.stringify(f.response || {}, null, 2);
+  const claimPretty = JSON.stringify(claims, null, 2);
+  const sentPretty = JSON.stringify(sent, null, 2);
+  const flags = (f.flags || []).map((fl) => `<span class="flag">${esc(fl.id)} ${esc(fl.detail || "")} (+${fl.points})</span>`).join("") || `<span class="muted">none</span>`;
+  const breaks = Object.entries(f.breaks || {}).map(([k, v]) => `<span class="break">${esc(k)} +${v}</span>`).join("") || `<span class="muted">none</span>`;
+  const decidedBy = (f.decided_by || []).map((d) => `<span class="arg">${esc(d)}</span>`).join(" ") || `<span class="muted">—</span>`;
+  return `<div class="drill">
+    <div class="col">
+      <div class="panel">
+        <h4>Why it ${OUTCOME[f.outcome] === "bad" ? "landed / broke" : "held"}</h4>
+        <div class="detail">${esc(OUTCOME_WHY[f.outcome] || "")}</div>
+        ${pipeline(f)}
+      </div>
+      <div class="panel">
+        <h4>What came back</h4>
+        <div class="mono small">${f.got ? `<span class="badge ${esc(f.got)}">${esc(f.got)}</span> ` : ""}${esc(f.reason || "")}${f.status != null ? ` · HTTP ${esc(f.status)}` : ""}</div>
+        ${f.detail ? `<div class="detail">${esc(f.detail)}</div>` : ""}
+        <pre>${esc(respPretty)}</pre>
+      </div>
+    </div>
+    <div class="col">
+      <div class="panel">
+        <h4>Scoring</h4>
+        <table class="kv">
+          <tr><th>Outcome</th><td><span class="out ${OUTCOME[f.outcome] || "flat"}">${esc(f.outcome)}</span></td></tr>
+          <tr><th>Level reached</th><td>${f.level ? lv(f.level, f.label || "") : "—"}</td></tr>
+          <tr><th>Decided by</th><td>${decidedBy}</td></tr>
+          <tr><th>Points</th><td class="pts">${f.points || 0}</td></tr>
+          <tr><th>Flags</th><td>${flags}</td></tr>
+          <tr><th>Breaks</th><td>${breaks}</td></tr>
+          <tr><th>Rows</th><td>${f.rows != null ? esc(f.rows) : "—"} · ${esc(f.distinct_pupils || 0)} distinct pupils</td></tr>
+        </table>
+        ${f.note ? `<div class="note">${esc(f.note)}</div>` : ""}
+      </div>
+      <div class="panel">
+        <h4>Mandate presented</h4>
+        <pre>${esc(claimPretty)}</pre>
+      </div>
+      <div class="panel">
+        <h4>Request payload sent</h4>
+        <pre>${esc(sentPretty)}</pre>
+      </div>
+    </div>
+  </div>`;
+}
+
 function findingRow(f) {
   const cls = OUTCOME[f.outcome] || "flat";
-  return `<tr>
-    <td data-label="Vector"><div class="vtitle">${esc(f.title || f.id)}</div><div class="vid">${esc(f.group)} · ${esc(f.id)}</div></td>
+  const open = state.expanded.has(f.id);
+  const summary = `<tr class="frow${open ? " open" : ""}" data-fid="${esc(f.id)}">
+    <td data-label="Vector"><div class="vtitle"><span class="caret">▶</span> ${esc(f.title || f.id)}</div><div class="vid">${esc(f.group)} · ${esc(f.id)}</div></td>
     <td data-label="Mandate">${mandateCell(f)}</td>
     <td data-label="Request">${requestCell(f)}</td>
     <td data-label="Outcome"><span class="out ${cls}">${esc(f.outcome)}</span></td>
@@ -457,13 +650,29 @@ function findingRow(f) {
     <td data-label="Points">${pointsCell(f)}</td>
     <td data-label="Detail">${detailCell(f)}</td>
   </tr>`;
+  const detail = open ? `<tr class="fdetail"><td colspan="7">${detailPanels(f)}</td></tr>` : "";
+  return summary + detail;
+}
+
+function filteredFindings() {
+  const {outcome, text} = state.fFilter;
+  const q = text.trim().toLowerCase();
+  return state.findings.filter((f) => {
+    if (outcome !== "all" && (OUTCOME[f.outcome] || "flat") !== outcome) return false;
+    if (!q) return true;
+    return [f.id, f.title, f.group, f.reason, f.got, f.outcome].some((v) => String(v || "").toLowerCase().includes(q));
+  });
 }
 
 function renderFindings() {
   const fs = state.findings;
-  $("findings").innerHTML = fs.length ? fs.map(findingRow).join("") : `<tr><td colspan="7" class="muted">No findings yet.</td></tr>`;
+  const shown = filteredFindings();
+  $("findings").innerHTML = shown.length
+    ? shown.map(findingRow).join("")
+    : `<tr><td colspan="7" class="muted">${fs.length ? "No findings match the filter." : "No findings yet."}</td></tr>`;
   const landed = fs.filter((f) => OUTCOME[f.outcome] === "bad").length;
-  $("findings-note").textContent = fs.length ? `${fs.length} findings · ${landed} needing attention` : "Run a vector to add a row.";
+  const filtered = shown.length !== fs.length ? ` · ${shown.length} shown` : "";
+  $("findings-note").textContent = fs.length ? `${fs.length} findings · ${landed} needing attention${filtered}` : "Run a vector to add a row.";
   renderChips();
   renderVectors();
 }
@@ -486,10 +695,14 @@ function lastOutcome(id) {
 
 function renderVectors() {
   const byo = isByo();
+  const q = state.vText.trim().toLowerCase();
+  const match = (v) => !q || [v.id, v.title, v.note, v.break].some((x) => String(x || "").toLowerCase().includes(q));
   const groups = {};
-  for (const v of state.vectors) (groups[v.group] = groups[v.group] || []).push(v);
+  for (const v of state.vectors) if (match(v)) (groups[v.group] = groups[v.group] || []).push(v);
   const order = GROUP_ORDER.filter((g) => groups[g]).concat(Object.keys(groups).filter((g) => !GROUP_ORDER.includes(g)));
+  if (!order.length) { $("vectors").innerHTML = `<p class="muted">No vectors match the filter.</p>`; return; }
   $("vectors").innerHTML = order.map((g) => {
+    const collapsed = !q && state.vCollapsed.has(g);
     const rows = groups[g].map((v) => {
       const blocked = byo && v.needs_mint;
       const tags = [];
@@ -505,13 +718,14 @@ function renderVectors() {
         <button type="button" data-run="${esc(v.id)}"${blocked ? " disabled title='needs our issuer key — own target only'" : ""}>Run</button>
       </div>`;
     }).join("");
-    return `<div class="vgroup">
-      <div class="vgroup-head">
+    return `<div class="vgroup${collapsed ? " collapsed" : ""}">
+      <div class="vgroup-head" data-toggle="${esc(g)}">
+        <span class="vcaret">▼</span>
         <h4>${esc(GROUP_NAME[g] || g)}</h4>
         <span class="count">${groups[g].length}</span>
         <button type="button" data-group="${esc(g)}" style="margin-left:auto">Run group</button>
       </div>
-      ${rows}
+      <div class="vbody">${rows}</div>
     </div>`;
   }).join("");
 }
@@ -738,24 +952,56 @@ async function loadTargets() {
 async function loadVectors() {
   const body = await getJson("/api/attack/vectors");
   state.vectors = body.vectors || [];
+  if (!state._vInit && state.vectors.length) {
+    const counts = {};
+    for (const v of state.vectors) counts[v.group] = (counts[v.group] || 0) + 1;
+    state.vCollapsed = new Set(Object.keys(counts).filter((g) => counts[g] > 12));  // big generated grids start folded
+    state._vInit = true;
+  }
   if (body.error && !state.vectors.length) $("vectors").innerHTML = `<p class="err">Could not load the catalog: ${esc(body.error)}</p>`;
   else renderVectors();
 }
 
 /* ---------------------------------------------------------------- events */
 
+function toggleFinding(id) {
+  if (state.expanded.has(id)) state.expanded.delete(id); else state.expanded.add(id);
+  renderFindings();
+}
+
+function toggleGroup(g) {
+  if (state.vCollapsed.has(g)) state.vCollapsed.delete(g); else state.vCollapsed.add(g);
+  renderVectors();
+}
+
 document.addEventListener("click", (event) => {
   const run = event.target.closest("[data-run]");
   if (run) { runVector(run.dataset.run, run); return; }
   const group = event.target.closest("[data-group]");
   if (group) { runGroup(group.dataset.group, group); return; }
+  const tgl = event.target.closest("[data-toggle]");
+  if (tgl) { toggleGroup(tgl.dataset.toggle); return; }
+  const frow = event.target.closest("[data-fid]");
+  if (frow) { toggleFinding(frow.dataset.fid); return; }
 });
 $("target").addEventListener("change", onTargetChange);
 $("url").addEventListener("change", renderChips);
 $("reload").addEventListener("click", loadVectors);
 $("run-all").addEventListener("click", runAll);
 $("export").addEventListener("click", exportJson);
-$("clear").addEventListener("click", () => { state.findings = []; renderFindings(); });
+$("clear").addEventListener("click", () => { state.findings = []; state.expanded.clear(); renderFindings(); });
+$("f-outcome").addEventListener("change", () => { state.fFilter.outcome = $("f-outcome").value; renderFindings(); });
+$("f-text").addEventListener("input", () => { state.fFilter.text = $("f-text").value; renderFindings(); });
+$("v-text").addEventListener("input", () => { state.vText = $("v-text").value; renderVectors(); });
+$("v-expand").addEventListener("click", () => { state.vCollapsed.clear(); renderVectors(); });
+$("v-collapse").addEventListener("click", () => { state.vCollapsed = new Set(state.vectors.map((v) => v.group)); renderVectors(); });
+$("expand-all").addEventListener("click", () => {
+  const shown = filteredFindings();
+  const allOpen = shown.length > 0 && shown.every((f) => state.expanded.has(f.id));
+  shown.forEach((f) => allOpen ? state.expanded.delete(f.id) : state.expanded.add(f.id));
+  $("expand-all").textContent = allOpen ? "Expand all" : "Collapse all";
+  renderFindings();
+});
 $("c-run").addEventListener("click", compose);
 $("c-save").addEventListener("click", saveVector);
 $("c-source").addEventListener("change", syncSourceFields);

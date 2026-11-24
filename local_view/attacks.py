@@ -49,6 +49,7 @@ from gateway.lib.common import (
     sign_bytes,
 )
 from gateway.lib.gateway_verify import (
+    PRIVATE_LEVEL,
     Request,
     result_levels,
     sensitivity_maps,
@@ -242,6 +243,25 @@ def _mint(spec: dict) -> tuple[str, int]:
         )
 
 
+# One run fires up to a few thousand vectors; minting a fresh mandate for each would append thousands of
+# status-list entries. Mandates are reusable (the per-request nonce and signature are built fresh each call),
+# so a run mints one token per distinct spec and reuses it. Reset at the start of every group or full run.
+_TOKEN_CACHE: dict[str, tuple[str, int | None]] = {}
+
+
+def _reset_run_cache() -> None:
+    _TOKEN_CACHE.clear()
+
+
+def _cached_mint(spec: dict) -> tuple[str, int | None]:
+    key = json.dumps(spec, sort_keys=True, default=str)
+    cached = _TOKEN_CACHE.get(key)
+    if cached is None:
+        cached = _mint(spec)
+        _TOKEN_CACHE[key] = cached
+    return cached
+
+
 def _base_token(target: Target, base: str) -> str:
     if target.mode == "byo":
         tok = target.mandates.get(base, "")
@@ -252,8 +272,8 @@ def _base_token(target: Target, base: str) -> str:
     if base == "live":
         return _read(STATE / "mandate.jwt")
     if base == "feature":
-        return _mint(_FEATURE_MINT)[0]
-    return _mint(_DEFAULT_MINT)[0]
+        return _cached_mint(_FEATURE_MINT)[0]
+    return _cached_mint(_DEFAULT_MINT)[0]
 
 
 def _signing_key(target: Target):
@@ -270,6 +290,7 @@ def _needs_issuer(forge: dict) -> bool:
 
 def _resolve_mandate(target: Target, mandate: dict):
     """Return (token, signing_priv). Raises PermissionError when a step needs our issuer on a byo target."""
+    revoke = bool(mandate.get("revoke"))
     idx: int | None = None
     if "raw" in mandate:
         token = mandate["raw"]
@@ -277,7 +298,7 @@ def _resolve_mandate(target: Target, mandate: dict):
         if not target.can_mint:
             msg = "minting a mandate needs the issuer key (own target only)"
             raise PermissionError(msg)
-        token, idx = _mint(mandate["mint"])
+        token, idx = _mint(mandate["mint"]) if revoke else _cached_mint(mandate["mint"])  # revoke needs a fresh idx
     else:
         token = _base_token(target, mandate.get("base", "default"))
     forge = mandate.get("forge")
@@ -286,11 +307,11 @@ def _resolve_mandate(target: Target, mandate: dict):
             msg = f"the {forge.get('op')} forge needs the issuer key (own target only)"
             raise PermissionError(msg)
         token = _forge_token(token, forge)
-    if mandate.get("revoke"):
+    if revoke:
         if not target.can_mint:
             msg = "revoking a mandate needs the issuer key (own target only)"
             raise PermissionError(msg)
-        if idx is None:
+        if idx is None:  # a base or raw mandate: mint one we own so the revoked bit is this call's
             token, idx = _mint(mandate.get("mint") or _DEFAULT_MINT)
         with _ISSUE:
             revoke_mandate(STATE, idx)
@@ -466,19 +487,60 @@ def _score(vector: dict, status: int, got: str | None, analysis: dict) -> tuple[
     return ("LANDED" if landed else "HELD"), breaks
 
 
+def _subdict(value: object, *path: str) -> dict:
+    """Walk a chain of keys, tolerating a malformed claim that put a non-dict where a dict belongs."""
+    for key in path:
+        value = value.get(key) if isinstance(value, dict) else None
+    return value if isinstance(value, dict) else {}
+
+
 def _trim_claims(claims: dict) -> dict:
-    status = (claims.get("status") or {}).get("status_list") or {}
+    if not isinstance(claims, dict):
+        return {}
+    status = _subdict(claims, "status", "status_list")
+    cnf = _subdict(claims, "cnf", "jwk")
     return {
         "iss": claims.get("iss"),
+        "agent_id": claims.get("agent_id"),
         "clearance": claims.get("clearance"),
         "role": claims.get("role"),
+        "role_exp": claims.get("role_exp"),
         "scope": claims.get("scope"),
         "deny": claims.get("deny"),
         "purpose": claims.get("purpose"),
+        "principal": _subdict(claims, "delegator").get("principal"),
+        "jti": claims.get("jti"),
         "exp": claims.get("exp"),
         "nbf": claims.get("nbf"),
         "idx": status.get("idx"),
+        "cnf_kty": f"{cnf.get('kty', '')} {cnf.get('crv', '')}".strip() or None,
     }
+
+
+_RESULT_SAMPLE = 8
+
+
+def _trim_result(result: object) -> object:
+    """A sample of what came back: enough rows to see the disclosure, never the whole export."""
+    if isinstance(result, list):
+        return {"rows": result[:_RESULT_SAMPLE], "shown": min(len(result), _RESULT_SAMPLE), "total": len(result)}
+    return result
+
+
+_TOKEN_PREVIEW = 80
+_SIG_PREVIEW = 44
+
+
+def _trim_request(request: dict) -> dict:
+    """The exact body sent, with the long opaque strings shortened — the claims are in mandate_claims."""
+    out = dict(request or {})
+    token = out.get("mandate")
+    if isinstance(token, str) and len(token) > _TOKEN_PREVIEW:
+        out["mandate"] = f"{token[:40]}…{token[-24:]}  ({len(token)} chars)"
+    sig = out.get("sig")
+    if isinstance(sig, str) and len(sig) > _SIG_PREVIEW:
+        out["sig"] = f"{sig[:28]}…  ({len(sig)} chars)"
+    return out
 
 
 def _finding(
@@ -493,6 +555,7 @@ def _finding(
     mandate_claims=None,
     disclosure=None,
     sensitivity=None,
+    response=None,
     error=None,
     notes=None,
 ) -> dict:
@@ -520,10 +583,11 @@ def _finding(
         "flags": analysis.get("flags", []),
         "rows": analysis.get("rows"),
         "distinct_pupils": analysis.get("distinct_pupils", 0),
-        "request": request or {},
+        "request": _trim_request(request or {}),
         "mandate_claims": _trim_claims(mandate_claims or {}),
         "disclosure": disclosure,
         "sensitivity": sensitivity,
+        "response": response or {},
         "notes": notes or [],
         "error": error,
     }
@@ -558,6 +622,13 @@ def _run_request(target: Target, vector: dict, http) -> dict:
     notes = []
     if tweaks.get("replay"):
         notes.append(f"first call HTTP {responses[0][0]}, replay HTTP {responses[-1][0]}")
+    response = {
+        "status": status,
+        "decision": decision,
+        "result": _trim_result(result),
+        "result_rows": analysis.get("rows"),
+        "error": payload.get("error"),
+    }
     return _finding(
         vector,
         status=status,
@@ -569,6 +640,7 @@ def _run_request(target: Target, vector: dict, http) -> dict:
         mandate_claims=claims,
         disclosure=decision.get("disclosure"),
         sensitivity=decision.get("sensitivity"),
+        response=response,
         notes=notes,
     )
 
@@ -604,6 +676,12 @@ def _run_demo(_target: Target, vector: dict, http) -> dict:
         analysis=analysis,
         request={"demo_mandate": mint, "demo_call": call},
         mandate_claims=claims,
+        response={
+            "status": status,
+            "decision": decision,
+            "result": _trim_result(inner.get("result")),
+            "mint": m_payload,
+        },
         notes=["/demo/mandate minted a mandate on request"],
     )
 
@@ -631,15 +709,21 @@ def _run_discovery(_target: Target, vector: dict, http) -> dict:
         else f"{path} answered without a private key",
         analysis=analysis,
         request={"GET": path},
+        response={"status": status, "body": payload},
     )
 
 
-def run_vector(target: Target, vector: dict, http) -> dict:
+def _run_one(target: Target, vector: dict, http) -> dict:
     runner = {"demo": _run_demo, "discovery": _run_discovery}.get(vector.get("type", "request"), _run_request)
     try:
         return runner(target, vector, http)
-    except (PermissionError, FileNotFoundError, ValueError, KeyError, jwt.PyJWTError) as exc:
+    except (PermissionError, FileNotFoundError, ValueError, KeyError, TypeError, AttributeError, jwt.PyJWTError) as exc:
         return _finding(vector, error=f"{type(exc).__name__}: {exc}")
+
+
+def run_vector(target: Target, vector: dict, http) -> dict:
+    _reset_run_cache()
+    return _run_one(target, vector, http)
 
 
 def _runnable(target: Target, vector: dict) -> bool:
@@ -647,11 +731,13 @@ def _runnable(target: Target, vector: dict) -> bool:
 
 
 def run_group(target: Target, group: str, http) -> list[dict]:
-    return [run_vector(target, v, http) for v in catalog() if v["group"] == group and _runnable(target, v)]
+    _reset_run_cache()
+    return [_run_one(target, v, http) for v in catalog() if v["group"] == group and _runnable(target, v)]
 
 
 def run_all(target: Target, http) -> list[dict]:
-    return [run_vector(target, v, http) for v in catalog() if _runnable(target, v)]
+    _reset_run_cache()
+    return [_run_one(target, v, http) for v in catalog() if _runnable(target, v)]
 
 
 def compose(target: Target, spec: dict, http) -> dict:
@@ -1419,6 +1505,454 @@ _CATALOG: list[dict] = [
 ]
 
 
+# ---------------------------------------------------------------- generated catalogue
+#
+# The hand-written vectors above are the curated tour. The generators below fan the same levers across every
+# school, tool, clearance, claim and malformation, so "run every vector" is a systematic sweep of more than a
+# thousand requests, not a sample. Each generated vector still carries the note that says why a sound gateway
+# holds it, so every finding explains itself. Request-level variants reuse the cached base mandate; only the
+# clearance, aggregate and cross-school mint grids mint, and the per-run cache keeps that to about a hundred.
+
+GEN_SCHOOLS = [f"SCH{n:02d}" for n in range(1, 13)]
+CENSUS_COLS = {
+    "Psuedo ID": 2,
+    "Gender": 2,
+    "Ethnicity": 4,
+    "Language": 3,
+    "FSMeligible": 3,
+    "InCareAtCurrentSchool": 4,
+    "AcademicYear": 1,
+    "CensusTerm": 1,
+    "EnrolStatus": 2,
+    "AgeAtStartOfAcademicYear": 2,
+    "URN": 1,
+}
+IDENT_COLS = ("Psuedo ID", "DisplayName")
+TOOL_LEVEL = {"search": 4, "pupil": 4, "roster": 2}  # the top sensitivity each tool can return
+
+_N_SCOPE = "The default mandate is search at SCH01 only; another tool or school is held (OUT_OF_SCOPE/CONSTRAINT)."
+_N_POP = "Proof of possession is checked before scope; a bad signature, timestamp or replayed nonce is POP_FAILED."
+_N_FORGE = "Any edit to a signed mandate must fail the issuer signature or the accredited-issuer check."
+_N_CRASH = "A malformed or incomplete mandate must be a 4xx denial, never an HTTP 500."
+_N_BULK = "At most 100 rows per call; more, or a non-integer limit, must be TOO_MUCH."
+_N_ROUND = "Aggregate counts leave rounded to the nearest 10, so a group smaller than 10 is not released as itself."
+
+
+def _col_id(col: str) -> str:
+    return "".join(ch.lower() if ch.isalnum() else "-" for ch in col).strip("-")
+
+
+def _scope1(tool: str, urn: str) -> list[dict]:
+    return [{"server": SERVER, "tools": [tool], "constraints": {"urn": [urn]}}]
+
+
+def _counts_scope() -> list[dict]:
+    return [{"server": SERVER, "tools": ["aggregate"], "constraints": {"table": [CENSUS]}}]
+
+
+def _args_for(tool: str, urn: str) -> dict:
+    table = {
+        "search": {"query": "2021/22", "urn": urn},
+        "pupil": {"pupil_id": FLAG["pupil"], "urn": urn},
+        "roster": {"urn": urn, "year_group": 11},
+        "draft": {"urn": urn, "pupil_ids": [FLAG["pupil"]]},
+        "aggregate": {"table": CENSUS, "group_by": ["URN"], "measure": "FSMeligible", "where": {"URN": urn}},
+        "write": {"urn": urn, "pupil_id": FLAG["pupil"], "column": "Gender", "before": "M", "after": "F"},
+        "get": {"path": CENSUS_CSV},
+    }
+    return table[tool]
+
+
+def _expect_allow(tool: str, clr: int, role: bool) -> bool:
+    lvl = TOOL_LEVEL[tool]
+    return clr >= lvl and (lvl < PRIVATE_LEVEL or role)
+
+
+def _clearance_note(tool: str, clr: int, role: bool, allow: bool) -> str:
+    lvl = TOOL_LEVEL[tool]
+    if allow:
+        return f"{tool} is level {lvl}; clearance {clr}{' + role' if role else ''} meets it — allowed by design."
+    if clr < lvl:
+        return f"{tool} is level {lvl}; clearance {clr} is below it — CLEARANCE_TOO_LOW."
+    return f"{tool} is level {lvl}; clearance {clr} meets it but no listed role — ROLE_REQUIRED."
+
+
+def _gen_scope() -> list[dict]:
+    out = []
+    for tool in ("search", "pupil", "roster", "draft", "aggregate", "write"):
+        for urn in GEN_SCHOOLS:
+            if tool == "search" and urn == "SCH01":
+                continue  # the default mandate's own grant — the baseline covers it
+            out.append(
+                {
+                    "id": f"g-scope-{tool}-{urn.lower()}",
+                    "group": "scope",
+                    "kind": "attack",
+                    "title": f"{tool} at {urn} on the default mandate",
+                    "mandate": {"base": "default"},
+                    "tool": tool,
+                    "arguments": _args_for(tool, urn),
+                    "note": _N_SCOPE,
+                }
+            )
+    return out
+
+
+def _gen_clearance() -> list[dict]:
+    out = []
+    for tool in ("search", "pupil", "roster"):
+        for urn in ("SCH01", FLAG["urn"], NAMED["urn"]):
+            for clr in (1, 2, 3, 4):
+                for role in (False, True):
+                    allow = _expect_allow(tool, clr, role)
+                    mint = {"scope": _scope1(tool, urn), "clearance": clr, "role": ROLE if role else None}
+                    out.append(
+                        {
+                            "id": f"g-clr-{tool}-{urn.lower()}-c{clr}-{'role' if role else 'norole'}",
+                            "group": "clearance",
+                            "kind": "info" if allow else "attack",
+                            "needs_mint": True,
+                            "title": f"{tool} at {urn}, clearance {clr}{' + role' if role else ''}",
+                            "mandate": {"mint": mint},
+                            "tool": tool,
+                            "arguments": _args_for(tool, urn),
+                            "note": _clearance_note(tool, clr, role, allow),
+                        }
+                    )
+    return out
+
+
+def _gen_forge() -> list[dict]:
+    wide = [{"server": SERVER, "tools": ["pupil", "search", "roster", "aggregate", "get"], "constraints": {}}]
+    wide_urn = [{"server": SERVER, "tools": ["pupil"], "constraints": {"urn": GEN_SCHOOLS}}]
+    tampers = (
+        ("raise-clr", {"set": {"clearance": 9}}),
+        ("widen", {"set": {"scope": wide}}),
+        ("widen-urn", {"set": {"scope": wide_urn}}),
+        ("drop-deny", {"del": ["deny"]}),
+        ("set-role", {"set": {"clearance": 4, "role": ROLE}}),
+        ("swap-iss", {"set": {"iss": "https://evil.invalid"}}),
+        ("bump-exp", {"set": {"exp": int(time.time()) + 999999}}),
+        ("purpose", {"set": {"purpose": "exfiltrate the flag pupil"}}),
+    )
+    ops = (("keep-sig", False), ("none", False), ("random-issuer", False), ("swap-cnf", False), ("hs256", True))
+    out = []
+    for opname, mint in ops:
+        for tname, forge in tampers:
+            out.append(
+                {
+                    "id": f"g-forge-{opname}-{tname}",
+                    "group": "forged",
+                    "kind": "attack",
+                    "break": "forged",
+                    "needs_mint": mint,
+                    "title": f"forge {opname}: {tname}",
+                    "mandate": {"base": "default", "forge": {"op": opname, **forge}},
+                    "tool": "pupil",
+                    "arguments": {"pupil_id": FLAG["pupil"], "urn": FLAG["urn"]},
+                    "note": _N_FORGE,
+                }
+            )
+    return out
+
+
+def _gen_pop() -> list[dict]:
+    tweaks = (
+        ("blank", {"sig": "blank"}),
+        ("garbage", {"sig": "garbage"}),
+        ("wrong-key", {"sig": "wrong-key"}),
+        ("stale", {"ts_offset": -SKEW}),
+        ("stale-near", {"ts_offset": -350}),
+        ("future", {"ts_offset": SKEW}),
+        ("future-near", {"ts_offset": 350}),
+        ("ts-zero", {"ts_offset": -int(time.time())}),
+        ("mutate-limit", {"mutate_after": {"limit": 500}}),
+        ("mutate-query", {"mutate_after": {"query": "SPR"}}),
+        ("replay", {"replay": True}),
+    )
+    out = []
+    for tool in ("search", "pupil", "get", "aggregate"):
+        for urn in GEN_SCHOOLS:
+            for tname, tw in tweaks:
+                out.append(
+                    {
+                        "id": f"g-pop-{tool}-{urn.lower()}-{tname}",
+                        "group": "nokey",
+                        "kind": "attack",
+                        "break": "nokey",
+                        "title": f"{tool} at {urn}: {tname}",
+                        "mandate": {"base": "default"},
+                        "tool": tool,
+                        "arguments": _args_for(tool, urn),
+                        "tweaks": tw,
+                        "note": _N_POP,
+                    }
+                )
+    return out
+
+
+def _lim_ok(lim: object) -> bool:
+    return type(lim) is int and 0 <= lim <= BULK_THRESHOLD
+
+
+def _gen_bulk() -> list[dict]:
+    limits = (-1000, -1, 0, 1, 2, 50, 99, 100, 101, 250, 1000, 99999, "100", 1.5)
+    out = []
+    for i, lim in enumerate(limits):
+        out.append(
+            {
+                "id": f"g-bulk-default-{i:02d}",
+                "group": "bulk",
+                "kind": "info" if _lim_ok(lim) else "attack",
+                "title": f"search SCH01, limit {lim!r}",
+                "mandate": {"base": "default"},
+                "tool": "search",
+                "arguments": {"query": "2021/22", "urn": "SCH01", "limit": lim},
+                "note": _N_BULK,
+            }
+        )
+    for urn in ("SCH02", FLAG["urn"], NAMED["urn"]):
+        mint = {"scope": _scope1("search", urn), "clearance": 4, "role": ROLE}
+        for lim in (100, 101, 1000):
+            out.append(
+                {
+                    "id": f"g-bulk-{urn.lower()}-{lim}",
+                    "group": "bulk",
+                    "kind": "info" if _lim_ok(lim) else "attack",
+                    "needs_mint": True,
+                    "title": f"search {urn}, limit {lim}",
+                    "mandate": {"mint": mint},
+                    "tool": "search",
+                    "arguments": {"query": "2021/22", "urn": urn, "limit": lim},
+                    "note": _N_BULK,
+                }
+            )
+    return out
+
+
+def _gen_aggregate() -> list[dict]:
+    out = []
+    group_cols = [c for c in CENSUS_COLS if c not in IDENT_COLS]
+    for col in group_cols:
+        for urn in GEN_SCHOOLS:
+            out.append(
+                {
+                    "id": f"g-agg-grp-{_col_id(col)}-{urn.lower()}",
+                    "group": "aggregate",
+                    "kind": "info",
+                    "needs_mint": True,
+                    "title": f"count by {col} at {urn}",
+                    "mandate": {"mint": {"scope": _counts_scope(), "clearance": 4, "role": ROLE}},
+                    "tool": "aggregate",
+                    "arguments": {"table": CENSUS, "group_by": [col], "measure": "FSMeligible", "where": {"URN": urn}},
+                    "note": _N_ROUND,
+                }
+            )
+    for col in IDENT_COLS:
+        out.append(
+            {
+                "id": f"g-agg-byid-{_col_id(col)}",
+                "group": "aggregate",
+                "kind": "attack",
+                "needs_mint": True,
+                "title": f"aggregate grouped by {col}",
+                "mandate": {"mint": {"scope": _counts_scope(), "clearance": 4, "role": ROLE}},
+                "tool": "aggregate",
+                "arguments": {"table": CENSUS, "group_by": [col], "measure": "FSMeligible"},
+                "note": f"Grouping by {col} makes each group one pupil — TOO_FINE.",
+            }
+        )
+    for col, lvl in CENSUS_COLS.items():
+        for clr in (2, 3, 4):
+            allow = clr >= lvl
+            mint = {"scope": _counts_scope(), "clearance": clr, "role": ROLE}
+            out.append(
+                {
+                    "id": f"g-agg-measure-{_col_id(col)}-c{clr}",
+                    "group": "aggregate",
+                    "kind": "info" if allow else "attack",
+                    "needs_mint": True,
+                    "title": f"count of {col} at clearance {clr}",
+                    "mandate": {"mint": mint},
+                    "tool": "aggregate",
+                    "arguments": {"table": CENSUS, "group_by": ["URN"], "measure": col},
+                    "note": f"{col} is level {lvl}; a count of it needs that clearance or it is CLEARANCE_TOO_LOW.",
+                }
+            )
+    return out
+
+
+def _gen_crash() -> list[dict]:
+    raws = [
+        "",
+        "not-a-jwt",
+        "a.b.c",
+        "a.b",
+        "...",
+        "a..c",
+        "{}",
+        "null",
+        "ey.ey.ey",
+        "x" * 4000,
+        "ma\u00f1ana.b.c",
+        "eyJ0eXAiOiJtYW5kYXRlK2p3dCJ9",
+    ]
+    # nbf is omitted on purpose: it is optional (defaults to 0), so deleting it is legitimate, not a crash.
+    dels = ("iss", "status", "cnf", "scope", "deny", "agent_id", "exp", "jti", "clearance")
+    bad = (("clearance", "four"), ("scope", "all"), ("status", 123), ("cnf", "x"), ("exp", "soon"), ("nbf", "later"))
+    base_args = {"query": "P0004", "urn": "SCH01"}
+    out = []
+    for i, raw in enumerate(raws):
+        out.append(
+            {
+                "id": f"g-crash-raw-{i:02d}",
+                "group": "crash",
+                "kind": "attack",
+                "break": "crash",
+                "title": f"malformed token #{i:02d}",
+                "mandate": {"raw": raw},
+                "tool": "search",
+                "arguments": base_args,
+                "note": _N_CRASH,
+            }
+        )
+    for claim in dels:
+        out.append(
+            {
+                "id": f"g-crash-del-{claim}",
+                "group": "crash",
+                "kind": "attack",
+                "break": "crash",
+                "needs_mint": True,
+                "title": f"valid signature, no {claim}",
+                "mandate": {"base": "default", "forge": {"op": "issuer", "del": [claim]}},
+                "tool": "search",
+                "arguments": base_args,
+                "note": _N_CRASH,
+            }
+        )
+    for claim, val in bad:
+        out.append(
+            {
+                "id": f"g-crash-bad-{claim}",
+                "group": "crash",
+                "kind": "attack",
+                "break": "crash",
+                "needs_mint": True,
+                "title": f"valid signature, {claim}={val!r}",
+                "mandate": {"base": "default", "forge": {"op": "issuer", "set": {claim: val}}},
+                "tool": "search",
+                "arguments": base_args,
+                "note": _N_CRASH,
+            }
+        )
+    return out
+
+
+def _gen_query() -> list[dict]:
+    queries = ["", " ", "\t", "x" * 3000, "'; DROP TABLE census;--", "%", "*", "../", "\u0000", "P0004", "SPR", "Y11"]
+    out = []
+    for i, q in enumerate(queries):
+        out.append(
+            {
+                "id": f"g-query-{i:02d}",
+                "group": "query",
+                "kind": "attack" if not str(q).strip() else "info",
+                "title": f"search SCH01, query {q[:16]!r}",
+                "mandate": {"base": "default"},
+                "tool": "search",
+                "arguments": {"query": q, "urn": "SCH01"},
+                "note": "An empty or whitespace query matches every row (TOO_MUCH); a real query stays in scope.",
+            }
+        )
+    return out
+
+
+def _gen_path() -> list[dict]:
+    paths = [
+        CENSUS_CSV,
+        NAMES_CSV,
+        DEPRIVATION_CSV,
+        "synthetic/../synthetic/synthetic_personal_data_school_census.csv",
+        "synthetic//synthetic_personal_data_school_census.csv",
+        "/etc/passwd",
+        "../../../etc/passwd",
+        "synthetic/synthetic_schools.csv/../synthetic_personal_data_school_census.csv",
+    ]
+    out = []
+    for i, path in enumerate(paths):
+        out.append(
+            {
+                "id": f"g-path-default-{i:02d}",
+                "group": "path",
+                "kind": "attack",
+                "title": f"get {path} on the default mandate",
+                "mandate": {"base": "default"},
+                "tool": "get",
+                "arguments": {"path": path},
+                "note": "get is not in the default scope, and no traversal resolves back into it — held.",
+            }
+        )
+    mint = {
+        "scope": [{"server": SERVER, "tools": ["get"], "constraints": {"path": [SCHOOLS]}}],
+        "clearance": 4,
+        "role": ROLE,
+    }
+    for i, path in enumerate(paths):
+        out.append(
+            {
+                "id": f"g-path-schools-{i:02d}",
+                "group": "path",
+                "kind": "info" if path == SCHOOLS else "attack",
+                "needs_mint": True,
+                "title": f"get {path} on a schools-file mandate",
+                "mandate": {"mint": mint},
+                "tool": "get",
+                "arguments": {"path": path},
+                "note": "The mandate is the schools file only; any other path or traversal is CONSTRAINT_VIOLATED.",
+            }
+        )
+    return out
+
+
+def _gen_keys() -> list[dict]:
+    routes = ["/describe", "/demo/issuer", "/demo/trust", "/healthcheck", "/demo/mandate", "/openapi.json", "/docs"]
+    return [
+        {
+            "id": f"g-keys-{_col_id(path)}",
+            "group": "keys",
+            "kind": "attack",
+            "type": "discovery",
+            "break": "keys",
+            "path": path,
+            "title": f"scan {path} for the issuer key",
+            "note": "No endpoint may return the issuer private key.",
+        }
+        for path in routes
+    ]
+
+
+_GENERATORS = (
+    _gen_scope,
+    _gen_clearance,
+    _gen_forge,
+    _gen_pop,
+    _gen_bulk,
+    _gen_aggregate,
+    _gen_crash,
+    _gen_query,
+    _gen_path,
+    _gen_keys,
+)
+
+
+def generated() -> list[dict]:
+    out: list[dict] = []
+    for gen in _GENERATORS:
+        out.extend(gen())
+    return out
+
+
 def saved() -> list[dict]:
     if not SAVED.is_file():
         return []
@@ -1429,7 +1963,7 @@ def saved() -> list[dict]:
 
 
 def catalog() -> list[dict]:
-    return _CATALOG + [{**v, "group": "saved"} for v in saved()]
+    return _CATALOG + generated() + [{**v, "group": "saved"} for v in saved()]
 
 
 _SAVE_KEYS = (

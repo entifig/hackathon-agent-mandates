@@ -120,13 +120,18 @@ def verify_mandate(token: str, registry, status_lists: dict[str, str]) -> dict:
         raise Reject("SIG_INVALID", str(e))
 
     now = time.time()
-    if claims.get("nbf", 0) > now + CLOCK_SKEW:
+    exp, nbf = claims.get("exp"), claims.get("nbf", 0)
+    if isinstance(exp, bool) or not isinstance(exp, (int, float)):
+        raise Reject("MANDATE_MALFORMED", "exp must be a number")
+    if isinstance(nbf, bool) or not isinstance(nbf, (int, float)):
+        raise Reject("MANDATE_MALFORMED", "nbf must be a number")
+    if nbf > now + CLOCK_SKEW:
         raise Reject("NOT_YET_VALID", claims["jti"])
-    if claims["exp"] < now - CLOCK_SKEW:
+    if exp < now - CLOCK_SKEW:
         raise Reject("EXPIRED", claims["jti"])
 
     # A verified mandate still has to carry the claims the status check and decide() read without a default.
-    # decide() catches only Reject, so a missing one is a 403 MANDATE_MALFORMED here, never an uncaught 500.
+    # decide() catches only Reject, so a missing or mistyped one is a 403 MANDATE_MALFORMED here, never a 500.
     cnf = claims.get("cnf")
     if not isinstance(cnf, dict) or not isinstance(cnf.get("jwk"), dict):
         raise Reject("MANDATE_MALFORMED", "cnf.jwk missing")   # decide() reads it to check the holder's signature
@@ -136,6 +141,10 @@ def verify_mandate(token: str, registry, status_lists: dict[str, str]) -> dict:
     sl = status["status_list"]
     if not isinstance(sl.get("uri"), str) or not isinstance(sl.get("idx"), int):
         raise Reject("MANDATE_MALFORMED", "status_list needs a uri and an idx")
+    if not isinstance(claims.get("scope"), list) or not isinstance(claims.get("deny"), list):
+        raise Reject("MANDATE_MALFORMED", "scope and deny must be lists")   # decide() passes them to check_request
+    if not isinstance(claims.get("agent_id"), str) or not claims["agent_id"]:
+        raise Reject("MANDATE_MALFORMED", "agent_id must be a non-empty string")
     sl_jwt = status_lists.get(sl["uri"])
     if sl_jwt is None:
         raise Reject("STATUS_UNAVAILABLE", sl["uri"])     # fail closed
