@@ -6,6 +6,8 @@
       -> verify proof of possession (request signed by cnf key, fresh nonce and ts; nonces persist: nonce_store.py)
       -> check request against scope, deny and constraints
       -> (budgeted mandates) only requests whose cost is countable; main.tools_call charges the budget (budget.py)
+      -> (aggregate) no identifying column, at most 2 group_by, `where` one census snapshot only; main.tools_call
+         suppresses small counts in the result before release (disclosure.py)
       -> decision record {ALLOW | DENY | STEP_UP, reason_code, ...}
 
 Reason codes are stable strings so the audit log and Day 2 scorecard can
@@ -21,14 +23,14 @@ from dataclasses import asdict, dataclass
 
 import jwt
 
-from . import delegation
+from . import delegation, disclosure
 from .budget import BudgetInvalid, chain_budgets, request_refusal
 from .common import canonical, jwk_thumbprint, jwk_to_pub, pub_to_pem, sha256_hex, verify_bytes
 from .delegation import Reject  # one class for every refusal, re-exported here
 from .nonce_store import MAX_NONCE_LEN, TS_WINDOW, NonceStore, NonceStoreUnavailable
 from .status_list import is_revoked
 
-POLICY_VERSION = "2026-11-18.1"
+POLICY_VERSION = "2026-11-24.1"  # q8: aggregate suppression (disclosure.py)
 CLOCK_SKEW = 30
 # Most rows one call may ask for (the MCP server's own default).
 # Per call only: many small calls still add up (question 11). A mandate's `budget` claim (budget.py) bounds the run.
@@ -257,6 +259,10 @@ class Gateway:
                 budgets = chain_budgets(claims)
             except BudgetInvalid as e:
                 raise Reject("BUDGET_INVALID", str(e))
+            try:
+                disclosure.parse_disclosure(claims)  # [q8] likewise: tools_call only sees a valid policy
+            except disclosure.DisclosureInvalid as e:
+                raise Reject("DISCLOSURE_INVALID", str(e))
             jwk = claims["cnf"]["jwk"]
             try:
                 agent_pub = jwk_to_pub(jwk)
@@ -288,6 +294,9 @@ class Gateway:
                     decision, code, detail = "DENY", "DELEGATION_WIDER", f"the parent mandate refuses this call: {why}"
             if budgets and decision != "DENY" and (why := request_refusal(req.tool, req.arguments)):
                 decision, code, detail = "DENY", "BUDGET_QUERY", why
+            # [q8] every aggregate call, whatever the mandate: refused before forwarding if the request is disclosive
+            if decision != "DENY" and req.tool == disclosure.TOOL and (why := disclosure.request_refusal(req.arguments)):
+                decision, code, detail = "DENY", *why
             return Decision(decision, code, agent_id=claims["agent_id"], detail=detail, **base), claims
         except Reject as r:
             return Decision("DENY", r.code, agent_id=None, detail=r.detail, **base), None

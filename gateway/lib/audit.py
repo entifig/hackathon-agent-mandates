@@ -369,6 +369,10 @@ _REASONS = {
     "AUDIT_UNAVAILABLE": "the gateway could not write its log, so it released nothing",
     "DELEGATION_INVALID": "a helper's mandate that was not properly handed on by the agent holding the original",
     "DELEGATION_WIDER": "a helper's mandate asked for more than the one it was handed on from",
+    "AGGREGATE_DISCLOSIVE": "counts that could single out a pupil",
+    "AGGREGATE_MALFORMED": "a counts request the gateway could not read",
+    "AGGREGATE_UNCHECKABLE": "counts the gateway could not check, so it released nothing",
+    "DISCLOSURE_INVALID": "the mandate's disclosure setting was malformed",
 }
 _SUSPICIOUS = {"POP_FAILED", "SIG_INVALID", "DELEGATION_INVALID"}
 
@@ -429,6 +433,8 @@ def plain(entry: dict) -> str:
             sent += f" about {len(pupils)} pupil{'s' if len(pupils) != 1 else ''} ({_ids(pupils)})"
         else:
             sent += " with no pupil IDs in it"
+        if released.get("suppressed"):  # [q8]
+            sent += f", {released['suppressed']} numbers suppressed as too small to release"
         return f"{head} {what} and {sent}: allowed"
     if d.get("decision") == "ALLOW":
         return f"{head} {what}: allowed, but nothing was sent (HTTP {entry.get('status')})"
@@ -621,6 +627,9 @@ def audited(state: dict):
             released = None
             if status == 200 and "result" in payload:
                 released = summarise_result(payload["result"])
+                if isinstance(payload.get("disclosure"), dict):  # [q8] an aggregate: what the gateway held back
+                    released["suppressed"] = payload["disclosure"].get("suppressed")
+                    released["min_count"] = payload["disclosure"].get("min_count")
                 if body.server == SERVER:  # a log read: the IDs in it are what others asked for, not data sent now
                     released = {**released, "rows": payload["result"].get("shown"), "columns": [], "pupils": [],
                                 "schools": [], "log_entries": payload["result"].get("shown")}
