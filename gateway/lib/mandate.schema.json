@@ -106,6 +106,10 @@
       "minLength": 1,
       "description": "A role the person holds, signed in for the agent. A level 4 result also needs a role the gateway lists (ROLE_REQUIRED); the gateway, not the mandate, says which roles open level 4. Not a string is ROLE_INVALID."
     },
+    "role_exp": {
+      "type": "integer",
+      "description": "Unix time the person stops holding the role, when that is before the mandate's exp. From then a call that can return level 4 is ROLE_EXPIRED; lower levels keep working. Missing means the role lasts as long as the mandate. Without a role, or not an integer, is ROLE_INVALID."
+    },
     "scope": {
       "type": "array",
       "minItems": 1,

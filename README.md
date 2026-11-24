@@ -139,6 +139,13 @@ The gateway sees each tool as `pupil-data.<tool>`.
 | `exp` | 3 days from issue (`--ttl`) | The `expired` case uses a copy that expired 2 minutes ago |
 | `cnf.jwk` | public key of `eval_pack/agent.pem` | Only that key can sign requests |
 | `principal` / `org` / `purpose` | `eval:runner` / `org:hackathon` / `eval set` | Who it was issued to and why |
+| `clearance` / `role` | `4` / `safeguarding-lead` | Our gateway refuses a mandate with no clearance, and level 4 data without a listed role |
+
+**The eval passes only with an eval pack minted from this repo.** Our gateway answers `CLEARANCE_MISSING` to every
+mandate that has no `clearance` claim, question 0 included, and `ROLE_REQUIRED` to census rows without a listed
+role. `make eval_setup` here signs both into the pack. A pack minted from the starter repo has neither, so every
+case that expects `ALLOW` would fail against this gateway. This is deliberate: a mandate that does not say how
+sensitive the data may be gets nothing.
 
 Question 5 also uses `eval_pack/two_schools.jwt`, the same mandate with `search` scoped to `SCH01` and `SCH02` as
 two separate entries.
@@ -175,6 +182,7 @@ To change one, issue a new mandate for the same key and revoke the old one. For 
 ```bash
 # 1. Issue the new mandate. Note the status idx it prints, which you need to revoke this mandate later
 uv run python -m gateway.cli issue --agent-key gateway/state/agent.pem --ttl 3600 -o gateway/state/sch02.jwt \
+  --clearance 4 --role safeguarding-lead \
   --scope '[{"server": "pupil-data", "tools": ["search"], "constraints": {"urn": ["SCH02"]}}]' \
   --purpose "Pupil-data lookups for school SCH02" --org school:SCH02
 # wrote mandate (status idx 3) to gateway/state/sch02.jwt
@@ -206,6 +214,7 @@ To limit the key further, issue a narrower mandate, e.g. `search` only for 10 mi
 
 ```bash
 uv run python -m gateway.cli issue --agent-key gateway/state/agent.pem --ttl 600 -o narrow.jwt \
+  --clearance 4 --role safeguarding-lead \
   --scope '[{"server": "pupil-data", "tools": ["search"], "constraints": {"urn": ["SCH01"]}}]'
 ```
 
@@ -216,8 +225,12 @@ mandate back. Never copy `issuer_key.pem`.
 
 ```bash
 uv run python -m gateway.cli keygen -o key.pem > public_key.jwk               # you: send public_key.jwk
-uv run python -m gateway.cli issue --agent-key public_key.jwk -o mandate.jwt  # them: send mandate.jwt back
+uv run python -m gateway.cli issue --agent-key public_key.jwk --clearance 2 -o mandate.jwt  # them: send it back
 ```
+
+`--clearance` is required: 1 public to 4 special category. Census rows are level 4, and level 4 also needs
+`--role safeguarding-lead` (or another role in the gateway's `GATEWAY_PRIVATE_ROLES`). Give a teammate the lowest
+clearance that does the job.
 
 Then call as below with `--mandate mandate.jwt --agent-key key.pem --url <their gateway>`.
 

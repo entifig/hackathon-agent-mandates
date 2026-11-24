@@ -226,15 +226,16 @@ def test_issue_with_claims_of_your_own(gw, tmp_path, capsys):
         "--agent-key",
         str(state / "agent.pem"),
         "--clearance",
-        "4",
+        "2",
         "-o",
         str(out),
     ]
 
-    cli.main([*issue, "--claims", '{"clearance": 2}'])
+    cli.main([*issue, "--claims", '{"max_limit": 20}'])
     capsys.readouterr()
     cli.main(["decode", str(out)])
-    assert json.loads(capsys.readouterr().out)["clearance"] == 2
+    decoded = json.loads(capsys.readouterr().out)
+    assert (decoded["clearance"], decoded["max_limit"]) == (2, 20)
 
     # clearance 2 against census rows (level 4) is denied on max: the gateway now reads the claim
     body = cli.sign_request(
@@ -249,6 +250,10 @@ def test_issue_with_claims_of_your_own(gw, tmp_path, capsys):
 
     with pytest.raises(ValueError, match="scope"):
         cli.main([*issue, "--claims", '{"scope": []}'])
+    # the flags are the only way to set these two: a claim must not sign a clearance or a role nobody typed
+    for claim in ('{"clearance": 4}', '{"role": "safeguarding-lead"}'):
+        with pytest.raises(ValueError, match="use --clearance, --role and --role-ttl"):
+            cli.main([*issue, "--claims", claim])
 
 
 def test_clearance_required_and_denied_on_max(gw, tmp_path):
@@ -574,6 +579,38 @@ def test_level_4_needs_a_role_the_gateway_lists(gw, tmp_path, monkeypatch):
     body = cli.sign_request(agent, server="pupil-data", tool="get", arguments={"path": ev.SCHOOLS}, mandate=token)
     r, _ = call(client, "get", body=body)
     assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "ROLE_INVALID")
+
+
+def test_a_refusal_does_not_say_whether_a_row_matched(gw, tmp_path):
+    client, call, state = gw
+    agent = priv_from_pem((state / "agent.pem").read_bytes())
+
+    def search(mandate, query):
+        args = {"query": query, "urn": "SCH01"}
+        body = cli.sign_request(agent, server="pupil-data", tool="search", arguments=args, mandate=mandate)
+        r = call(client, "search", body=body)[0]
+        d = r.json()["decision"]
+        return r.status_code, d["reason_code"], d["sensitivity"]["decided_by"]
+
+    # the labels are decided from the request: a query that matches a row and one that matches none get the
+    # same answer, so the refusal cannot be used to spell out a census row one character at a time
+    for mandate, code in (
+        (_issue(state, tmp_path / "two.jwt", 2), "CLEARANCE_TOO_LOW"),
+        (_issue(state, tmp_path / "four.jwt", 4), "ROLE_REQUIRED"),
+    ):
+        hit, miss = search(mandate, f"{ev.PUPIL},F,WHIT"), search(mandate, "no-such-row")
+        assert hit == miss == (403, code, ["Ethnicity", "InCareAtCurrentSchool"])
+
+    # a file with no label is not public; the manifest, which holds the labels, is
+    mandate = _issue(state, tmp_path / "files.jwt", 3, [{"server": "pupil-data", "tools": ["get"]}])
+
+    def get(path):
+        body = cli.sign_request(agent, server="pupil-data", tool="get", arguments={"path": path}, mandate=mandate)
+        r = call(client, "get", body=body)[0]
+        return r.status_code, r.json()["decision"]["reason_code"]
+
+    assert get("synthetic/synthetic_manifest.json") == (200, "IN_SCOPE")
+    assert get("writes/corrections.jsonl") == (403, "CLEARANCE_TOO_LOW")
 
 
 def test_eval_set_passes_against_template_gateway(gw, tmp_path):

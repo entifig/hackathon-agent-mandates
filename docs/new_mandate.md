@@ -13,20 +13,21 @@ Choose the place by what the field limits.
 
 | It limits | Where it goes | Flag on `cli issue` |
 | --- | --- | --- |
-| The whole mandate | A top-level claim | `--claims '{"clearance": 2}'` |
+| The whole mandate | A top-level claim | `--claims '{"max_limit": 20}'` |
 | One grant (one tool at one school) | A key in that scope entry, beside `constraints` | `--scope '[{..., "columns": [...]}]'` |
 
 ```bash
 uv run python -m gateway.cli issue --agent-key gateway/state/agent.pem -o gateway/state/clearance.jwt \
-  --claims '{"clearance": 2}' \
+  --clearance 2 --claims '{"max_limit": 20}' \
   --scope '[{"server": "pupil-data", "tools": ["search"], "constraints": {"urn": ["SCH01"]},
              "columns": ["URN", "AcademicYear"]}]'
 uv run python -m gateway.cli decode gateway/state/clearance.jwt   # check it is in there
 ```
 
-- `clearance` and `columns` are only examples. The names and what they mean are yours.
+- `max_limit` and `columns` are only examples. The names and what they mean are yours.
 - `--claims` refuses a name the mandate already uses (`scope`, `exp`, `cnf` and so on), so it cannot quietly replace
-  one.
+  one. That now includes `clearance` and `role`: this gateway enforces both, and they have flags of their own
+  (`--clearance` is required, `--role` opens level 4).
 - Do not put a new field inside `constraints`. Every key there is treated as a request argument that must be present
   and must have one of the listed values.
 - For long JSON, keep it in a file: `--claims "$(cat clearance.json)"`.

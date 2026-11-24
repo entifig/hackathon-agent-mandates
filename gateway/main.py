@@ -7,6 +7,7 @@ POST /tools/call  {server, tool, arguments, mandate, nonce, ts, sig}
 
 import json
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from gateway.lib.gateway_verify import (
     SMALL_COUNT,
     Gateway,
     Request,
+    request_levels,
     result_levels,
     round_counts,
     sensitivity_maps,
@@ -92,6 +94,7 @@ def load_labels() -> None:
         raise FileNotFoundError(msg)
     classification = json.loads(manifest.read_text())["classification"]
     state["columns"], state["tables"] = sensitivity_maps(classification)
+    state["table_columns"] = classification["columns"]
     state["max_level"] = max(map(int, classification["levels"]))
     state["level_names"] = {int(level): name for level, name in classification["levels"].items()}
 
@@ -139,7 +142,8 @@ async def describe() -> dict:
         "private_data": {
             "level": PRIVATE_LEVEL,
             "roles": sorted(state["private_roles"]),
-            "rule": "a result at this level needs the clearance and one of these roles in the mandate's role claim",
+            "rule": "a call that can return this level needs the clearance and one of these roles in the mandate's "
+            "role claim; if the mandate has a role_exp, the role stops opening this level at that time",
         },
         "signing": {
             "alg": "Ed25519 by the key in the mandate's cnf.jwk; sig is base64url without padding",
@@ -154,6 +158,31 @@ async def describe() -> dict:
             },
         },
     }
+
+
+def refuse_on_labels(decision, levels: dict[str, int], subject: str) -> JSONResponse | None:
+    """Record the labels on the decision. A 403 if they are above the clearance or need a role it lacks."""
+    decision.sensitivity = sensitivity_record(levels, state["level_names"], decision.clearance)
+    level = decision.sensitivity["level"]
+    decided_by = ", ".join(decision.sensitivity["decided_by"])
+    if decision.clearance is not None and level > decision.clearance:
+        decision.decision, decision.reason_code = "DENY", "CLEARANCE_TOO_LOW"
+        decision.detail = f"{subject} sensitivity {level} above clearance {decision.clearance} ({decided_by})"
+        return JSONResponse({"decision": decision.to_dict()}, status_code=403)
+    if level >= PRIVATE_LEVEL and decision.role not in state["private_roles"]:
+        decision.decision, decision.reason_code = "DENY", "ROLE_REQUIRED"
+        roles = ", ".join(sorted(state["private_roles"]))
+        held = f"the role {decision.role}" if decision.role else "no role"
+        decision.detail = f"{subject} sensitivity {level} ({decided_by}), open to {roles}; the mandate has {held}"
+        return JSONResponse({"decision": decision.to_dict()}, status_code=403)
+    # the role can end before the mandate does; the rest of the mandate keeps working below PRIVATE_LEVEL
+    if level >= PRIVATE_LEVEL and decision.role_exp is not None and time.time() >= decision.role_exp:
+        decision.decision, decision.reason_code = "DENY", "ROLE_EXPIRED"
+        decision.detail = (
+            f"{subject} sensitivity {level} ({decided_by}); the role {decision.role} ended at {decision.role_exp}"
+        )
+        return JSONResponse({"decision": decision.to_dict()}, status_code=403)
+    return None
 
 
 @app.post("/tools/call")
@@ -174,29 +203,32 @@ async def tools_call(body: CallBody):
     target = MCP_SERVERS.get(body.server)
     if target is None:
         raise HTTPException(404, f"no MCP server configured for {body.server!r}")
+    # Q6 deny on max, decided before the call from everything the tool can return. A refusal that waited for
+    # the result would tell the agent whether a row matched: 403 if one did, 200 [] if none.
+    load_labels()
+    levels = request_levels(
+        body.tool,
+        body.arguments,
+        state["table_columns"],
+        state["columns"],
+        state["tables"],
+        state["max_level"],
+    )
+    refusal = refuse_on_labels(decision, levels, "the call can return")
+    if refusal is not None:
+        return refusal
     try:
         async with Client(target) as client:
             result = await client.call_tool(body.tool, body.arguments)
     except ToolError as e:
-        return JSONResponse({"decision": record, "error": str(e)}, status_code=502)
-    # Q6 deny on max: the most sensitive column in the result decides, against the mandate's clearance
-    load_labels()
-    levels = result_levels(
+        return JSONResponse({"decision": decision.to_dict(), "error": str(e)}, status_code=502)
+    # second layer: the labels on what actually came back, in case the result carries a key the shape did not
+    levels |= result_levels(
         body.tool, body.arguments, result.data, state["columns"], state["tables"], state["max_level"]
     )
-    decision.sensitivity = sensitivity_record(levels, state["level_names"], decision.clearance)
-    level = decision.sensitivity["level"]
-    decided_by = ", ".join(decision.sensitivity["decided_by"])
-    if decision.clearance is not None and level > decision.clearance:
-        decision.decision, decision.reason_code = "DENY", "CLEARANCE_TOO_LOW"
-        decision.detail = f"result reaches sensitivity {level} above clearance {decision.clearance} ({decided_by})"
-        return JSONResponse({"decision": decision.to_dict()}, status_code=403)
-    if level >= PRIVATE_LEVEL and decision.role not in state["private_roles"]:
-        decision.decision, decision.reason_code = "DENY", "ROLE_REQUIRED"
-        roles = ", ".join(sorted(state["private_roles"]))
-        held = f"the role {decision.role}" if decision.role else "no role"
-        decision.detail = f"result reaches sensitivity {level} ({decided_by}), open to {roles}; the mandate has {held}"
-        return JSONResponse({"decision": decision.to_dict()}, status_code=403)
+    refusal = refuse_on_labels(decision, levels, "the result reaches")
+    if refusal is not None:
+        return refusal
     data = result.data
     if body.tool == "aggregate":
         data = round_counts(data, state["small_count"])

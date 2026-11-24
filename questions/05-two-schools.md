@@ -17,8 +17,9 @@ from one and `path` from the other?
 
 `check_request` (`gateway/lib/gateway_verify.py`) now tries every scope entry that lists the tool, and allows the
 call if any one entry accepts every argument it constrains. Each entry is judged whole, so a request cannot take
-`urn` from one entry and `path` from another. When no entry accepts the call, the reason reported is the first
-matching entry's, which keeps the question 2 reason codes as they were. The question 3 limits and the step-up check
+`urn` from one entry and `path` from another. When no entry accepts the call, the reason reported is one entry's:
+a wrong value (`CONSTRAINT_VIOLATED`) is preferred to a missing argument (`CONSTRAINT_MISSING`), and the first entry
+wins a tie, which keeps the question 2 reason codes as they were. The question 3 limits and the step-up check
 run only once an entry has accepted the call.
 
 `make eval_run` passes all of questions 0 to 5. The test is `test_any_scope_entry_may_allow_but_entries_do_not_mix`
@@ -71,5 +72,5 @@ uv run python -m gateway.cli call --mandate eval_pack/two_schools.jwt --agent-ke
 
 Entries now add up, so the widest entry for a tool decides what that tool may do: one entry with no constraints
 allows every school, whatever the entries beside it say. The gateway cannot tell an issuer who meant that from one
-who added a loose entry by mistake. The denial reason is also only the first entry's, so it may not name the entry
+who added a loose entry by mistake. The denial reason is also only one entry's, so it may not name the entry
 the caller was aiming at.

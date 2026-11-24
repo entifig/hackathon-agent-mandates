@@ -29,7 +29,7 @@ from gateway.lib.gateway_verify import (
     PRIVATE_LEVEL,
     PRIVATE_ROLES,
     SMALL_COUNT,
-    result_levels,
+    request_levels,
     sensitivity_maps,
     sensitivity_record,
 )
@@ -163,7 +163,7 @@ _META: list[tuple[int, str, str, str, str, str]] = [
         6,
         "answered",
         "Send me the full records for Castleton's pupils, ethnicity and care status included.",
-        "The clearance claim is checked before the scope. Without one the call is CLEARANCE_MISSING, and the decision carries a notice naming the authenticated agent. After the data server answers, every key of the result is looked up in the manifest, which is re-read on each call. The most restrictive label decides, so Ethnicity at 4 outranks URN at 1. Above the clearance the result is dropped with CLEARANCE_TOO_LOW. Level 4 also needs a role. The issuer signs the role the person holds into the agent's mandate, and the gateway lists the roles that open level 4: PRIVATE_ROLES, safeguarding-lead unless GATEWAY_PRIVATE_ROLES says otherwise. Without a listed role the result is dropped with ROLE_REQUIRED.",
+        "The clearance claim is checked before the scope. Without one the call is CLEARANCE_MISSING, and the decision carries a notice naming the authenticated agent. Before the call is forwarded, every key the tool can return is looked up in the manifest, which is re-read on each call. The most restrictive label decides, so Ethnicity at 4 outranks URN at 1. Above the clearance the call is refused with CLEARANCE_TOO_LOW, whether or not any row would have matched, so a refusal cannot be used to spell out a record. The result is labelled again when it comes back, in case it carries a key the gateway did not expect. Level 4 also needs a role. The issuer signs the role the person holds into the agent's mandate, and the gateway lists the roles that open level 4: PRIVATE_ROLES, safeguarding-lead unless GATEWAY_PRIVATE_ROLES says otherwise. Without a listed role the call is refused with ROLE_REQUIRED.",
         "Unresolved: the clearance and the role are whatever the issuer signed. The gateway cannot tell whether the person still holds the role (question 13), and nothing records consent from the pupil or a parent. The notice goes back in the response. Nothing delivers it to the person yet.",
         "Castleton at clearance 4 with the safeguarding-lead role gets the full record. At clearance 4 with no role the same request is refused with ROLE_REQUIRED. Under clearance 2 it is refused because Ethnicity and InCareAtCurrentSchool are level 4, and the Year 11 names at level 2 still pass. With no clearance the call is refused, and the notice says which agent asked.",
     ),
@@ -179,7 +179,7 @@ _META: list[tuple[int, str, str, str, str, str]] = [
         8,
         "answered",
         "How many pupils in care does each school have, split by ethnic group?",
-        "Both. Before the call, an aggregate grouped or filtered by Psuedo ID is refused as TOO_FINE, because each group would be one pupil. After the call the labels decide first: a count needs its measure's clearance, and each group_by key and where filter needs its own. A level 4 count, such as care by ethnic group, also needs a listed role, as in question 6. Then the gateway rounds every total and count to the nearest 10, so a count below 10 comes out as 0 or 10. The large counts are rounded too, because that is what stops subtraction. Brookmere has 74 meal rows and 69 of them are WHIT, so two exact answers would give away the other 5. Rounded, both read 70. The floor is SMALL_COUNT in the gateway, 10 unless GATEWAY_SMALL_COUNT says otherwise, and no mandate claim changes it.",
+        "Both. Before the call, an aggregate grouped or filtered by Psuedo ID is refused as TOO_FINE, because each group would be one pupil. The labels are decided before the call too: a count needs its measure's clearance, and each group_by key and where filter needs its own. A level 4 count, such as care by ethnic group, also needs a listed role, as in question 6. After the call the gateway rounds every total and count to the nearest 10, so a count below 10 comes out as 0 or 10. The large counts are rounded too, because that is what stops subtraction. Brookmere has 74 meal rows and 69 of them are WHIT, so two exact answers would give away the other 5. Rounded, both read 70. The floor is SMALL_COUNT in the gateway, 10 unless GATEWAY_SMALL_COUNT says otherwise, and no mandate claim changes it.",
         "Unresolved: counts are census rows, and one pupil can be five of them, so one or two children can still round to 10. A where filter on enough other columns can still single out one pupil. Counting each pupil once, by naming one census per answer or counting distinct pupils in the gateway, would close both.",
         "Free school meals by school are released, rounded to tens. Care by school and ethnic group is refused at clearance 3. At clearance 4 with the safeguarding-lead role every cell comes back as a multiple of 10: 0, 10 or 20. Brookmere's count and its WHIT count both read 70, so subtracting them gives nothing away. Grouping by Psuedo ID is refused before the call.",
     ),
@@ -188,7 +188,7 @@ _META: list[tuple[int, str, str, str, str, str]] = [
         "open",
         "Just correct the record yourself.",
         "The default deny lists *.write, so write is DENIED_BY_RULE and never reaches STEP_UP. A mandate with an empty deny would get 202, and nothing can release it.",
-        "No approver and no one-shot approval id. The clearance is checked on the result, so a write that got through would land before its labels were read.",
+        "No approver and no one-shot approval id. The clearance is checked before the call is forwarded, so a write above the mandate's clearance never lands, but nothing checks who approved one within it.",
         "Allow write only with an approval id the gateway accepts once, and leave an unanswered hold at 202.",
     ),
     (
@@ -605,29 +605,12 @@ def labels_in_force() -> dict:
     return {"path": _rel(path), **_classification()}
 
 
-def _result_shape(tool: str, arguments: dict, columns: dict) -> object:
-    """A result with the keys the tool returns, so the gateway's own rules can label it before the call."""
-    census = dict.fromkeys(columns.get(CENSUS, {}))
-    group_by = arguments.get("group_by")
-    shapes = {
-        "search": [census],
-        "pupil": {**census, "DisplayName": None, **dict.fromkeys(columns.get("personal_data_deprivation", {}))},
-        "roster": [{"Psuedo ID": None, "DisplayName": None}],
-        "draft": [{"Psuedo ID": None, "letter": None}],
-        "aggregate": [{**dict.fromkeys(group_by if isinstance(group_by, list) else []), "total": 0, "count": 0}],
-        "write": dict.fromkeys(("ts", "pupil_id", "urn", "column", "before", "after", "reason")),
-        "classification": dict.fromkeys(("levels", "tables", "columns")),
-        "get": [],
-    }
-    return shapes.get(tool)
-
-
 def expected_labels(tool: str, arguments: dict) -> dict:
+    """The labels the gateway itself decides from the request, before it forwards the call."""
     clf = _classification()
     columns, tables = sensitivity_maps(clf)
     names = {int(level): name for level, name in clf["levels"].items()}
-    shaped = _result_shape(tool, arguments, clf["columns"])
-    levels = result_levels(tool, arguments, shaped, columns, tables, max(names, default=4))
+    levels = request_levels(tool, arguments, clf["columns"], columns, tables, max(names, default=4))
     return sensitivity_record(levels, names, None)
 
 
@@ -725,7 +708,7 @@ def _label_steps(tool: str, arguments: dict, claims: dict) -> list[dict]:
     source = ", ".join(expected["decided_by"]) or "no labelled data"
     value = f"level {expected['level']} from {source}"
     if isinstance(clearance, int) and expected["level"] > clearance:
-        return [_step("labels", value, f"clearance {clearance}", "CLEARANCE_TOO_LOW, the result is dropped", "fail")]
+        return [_step("labels", value, f"clearance {clearance}", "CLEARANCE_TOO_LOW, the call is refused", "fail")]
     if expected["level"] < PRIVATE_LEVEL:
         steps = [_step("labels", value, f"clearance {clearance}", "within clearance, ALLOW", "allow")]
     else:
@@ -733,7 +716,11 @@ def _label_steps(tool: str, arguments: dict, claims: dict) -> list[dict]:
         roles = f"{', '.join(sorted(PRIVATE_ROLES))} (PRIVATE_ROLES, a gateway setting)"
         steps = [_step("labels", value, f"clearance {clearance}", "within clearance", "pass")]
         if not (isinstance(role, str) and role in PRIVATE_ROLES):
-            return [*steps, _step("role", role or "none", roles, "ROLE_REQUIRED, the result is dropped", "fail")]
+            return [*steps, _step("role", role or "none", roles, "ROLE_REQUIRED, the call is refused", "fail")]
+        role_exp = claims.get("role_exp")
+        if isinstance(role_exp, int) and time.time() >= role_exp:
+            ended = f"ended at {role_exp} (role_exp, signed by the issuer)"
+            return [*steps, _step("role", role, ended, "ROLE_EXPIRED, the call is refused", "fail")]
         steps.append(_step("role", role, roles, "a listed role, ALLOW", "allow"))
     if tool == "aggregate":
         nearest = f"the nearest {SMALL_COUNT} (SMALL_COUNT, a gateway setting)"
