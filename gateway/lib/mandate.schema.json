@@ -182,6 +182,23 @@
           "description": "Mandates from one issuer, for one delegator.principal, with the same id share one budget (e.g. a parent and a delegated child). Defaults to the mandate's jti. The ledger key is (iss, delegator.principal, id or jti), so another issuer or person picking the same id gets a separate budget."
         }
       }
+    },
+    "disclosure": {
+      "type": "object",
+      "description": "Optional small-count policy for `aggregate` (question 8), enforced by this team's gateway only (gateway/lib/disclosure.py). The gateway applies its own floor to EVERY aggregate call whether or not this claim is present: groups are counted in distinct pupils, a group of fewer than min_count pupils is left out, a count is shown only if at least min_count pupils have the measure and at least min_count do not, secondary suppression stops a margin giving a hidden cell back, and every released number is rounded to round_to. This claim can only make that stricter: a value below the gateway floor (min_count 10, round_to 5) is raised to the floor. Malformed: every call is denied DISCLOSURE_INVALID.",
+      "additionalProperties": false,
+      "properties": {
+        "min_count": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Fewest distinct pupils a released number may rest on. Floor 10."
+        },
+        "round_to": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Released totals and counts are rounded to the nearest multiple of this. Floor 5."
+        }
+      }
     }
   }
 }

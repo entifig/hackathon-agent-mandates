@@ -5,6 +5,8 @@ POST /tools/call  {server, tool, arguments, mandate, nonce, ts, sig}
   -> ALLOW: forward to the MCP server, DENY: 403, STEP_UP: 202
   -> a mandate with a `budget` claim (gateway/lib/budget.py): the request is charged before forwarding and the
      result is checked before release; over budget is DENY BUDGET_EXHAUSTED, 403, and nothing is returned
+  -> `aggregate`, any mandate (gateway/lib/disclosure.py): forwarded grouped by pupil, summed back to the groups asked
+     for, small counts suppressed and the rest rounded before release, with a `disclosure` note
 
 GATEWAY_DEMO=1 turns on the /demo walkthrough routes (404 otherwise). They hold the issuer key and an agent key, so
 anyone who can reach them can mint and revoke mandates: a deployed gateway runs with GATEWAY_DEMO unset or 0.
@@ -30,7 +32,10 @@ from fastmcp.exceptions import ToolError
 from pydantic import BaseModel, Field
 
 from gateway.cli import sign_request
-from gateway.lib import audit  # AUDIT(q14/q16)
+from gateway.lib import (
+    audit,  # AUDIT(q14/q16)
+    disclosure,  # [q8]
+)
 from gateway.lib.budget import ID_BOUNDED_TOOLS, Budget, Ledger, LedgerUnavailable, parse_budget, pupil_ids
 from gateway.lib.common import generate_keypair, pub_to_jwk
 from gateway.lib.gateway_verify import MAX_TS, Decision, Gateway, Request, normalised_arguments
@@ -176,6 +181,8 @@ async def tools_call(body: CallBody):
     target = MCP_SERVERS.get(body.server)
     if target is None:
         raise HTTPException(404, f"no MCP server configured for {body.server!r}")
+    if body.tool == disclosure.TOOL:  # [q8] every aggregate result is checked; a budgeted mandate never gets here
+        return await _forward_aggregate(target, body, decision, disclosure.parse_disclosure(claims))
     budget = parse_budget(claims)  # validated in decide: None or a well-formed budget
     if budget is None:
         return await _forward(target, body, record)
@@ -199,6 +206,22 @@ async def _forward(target, body: CallBody, record: dict):
     if ok:
         return {"decision": record, "result": payload}
     return JSONResponse({"decision": record, "error": payload}, status_code=502)
+
+
+async def _forward_aggregate(target, body: CallBody, decision: Decision, policy: disclosure.Policy):
+    """[q8] Ask for the counts per pupil, release the counts per group with small ones suppressed."""
+    upstream = body.model_copy(update={"arguments": disclosure.upstream_arguments(body.arguments)})
+    ok, payload = await call_upstream(target, upstream)
+    if not ok:
+        return JSONResponse({"decision": decision.to_dict(), "error": payload}, status_code=502)
+    try:
+        result, note = disclosure.protect(body.arguments, payload, policy)
+    except disclosure.UncheckableResult as e:
+        refusal = dataclasses.replace(decision, decision="DENY", reason_code="AGGREGATE_UNCHECKABLE", detail=str(e))
+        return JSONResponse({"decision": refusal.to_dict()}, status_code=403)
+    detail = f"min {note['min_count']} pupils, rounded to {note['round_to']}, {note['suppressed']} numbers suppressed"
+    record = dataclasses.replace(decision, detail=detail).to_dict()
+    return {"decision": record, "result": result, "disclosure": note}
 
 
 def _pupils_detail(ledger: Ledger, budget: Budget, what: str) -> str:
