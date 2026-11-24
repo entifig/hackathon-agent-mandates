@@ -1,0 +1,8 @@
+[
+  {
+    "server": "pupil-data",
+    "tools": ["roster"],
+    "constraints": {"urn": ["SCH05"], "year_group": ["11"], "academic_year": ["2023/24"], "term": ["SPR"]}
+  },
+  {"server": "pupil-data", "tools": ["search"], "constraints": {"urn": ["SCH05"]}}
+]

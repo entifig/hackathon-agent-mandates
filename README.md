@@ -40,6 +40,8 @@ What we want at the end is what you found out: where agent mandates hold and whe
    a request it denies for the question it took, laid out like the [worked example](questions/02-worked-example.md).
 4. **Deploy and harden** (Day 2 morning). Put your gateway on a URL and post it, with the default attack mandate and a
    feature mandate from your Day 1 question ([ATTACK_SCORING.md](day_2_attack/ATTACK_SCORING.md)). Add any final protection (~2h)
+   Deploy it with `GATEWAY_DEMO` unset or `0` (the default): the `/demo` walkthrough routes hold your issuer key, so
+   anyone who can reach them can mint and revoke mandates.
 5. **Attack** (Day 2 afternoon). Try to get data out of other teams' gateways that their mandates do not cover.
    An attack *lands* when a request goes through the gateway and returns data outside the mandate. 
 6. **Show and tell** (Day 2, 16:00). One attack that landed on you, one you landed, one thing this design gets
@@ -61,6 +63,8 @@ What we want at the end is what you found out: where agent mandates hold and whe
 4. Read [gateway/lib/gateway_verify.py](gateway/lib/gateway_verify.py). It walks through the current verification process.
 
 Ports: MCP server `:8080`, gateway `:8082`, demo UI `localhost:8081/demo` (a walkthrough of issuing a mandate and making a call - feel free to extend, e.g - for human in the loop escalation.).
+The walkthrough needs the gateway's `/demo` routes, which are off by default: for local use only, uncomment
+`GATEWAY_DEMO=1` in `.env` and run `make run`.
 `make test` and `make lint` run the tests and ruff. The data sources are listed in
 [mcp_server/data/synthetic/synthetic_manifest.json](mcp_server/data/synthetic/synthetic_manifest.json).
 

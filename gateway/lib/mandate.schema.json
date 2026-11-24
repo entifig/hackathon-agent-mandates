@@ -157,6 +157,31 @@
           }
         }
       }
+    },
+    "budget": {
+      "type": "object",
+      "description": "Optional run budget (question 11), enforced by this team's gateway only (gateway/lib/budget.py). Counted over the mandate's whole life, across calls; usage persists across gateway restarts. Charged on the REQUEST before forwarding: every pupil ID named in the arguments counts, found or not, and a call that would go past `pupils` or `calls` is refused (403 BUDGET_EXHAUSTED). A budgeted mandate may not use `aggregate`, and may `search` only by exactly one pupil ID (403 BUDGET_QUERY). Once full, only calls naming already-counted pupils go through. A listing result (roster, get) that would go past `pupils` is withheld whole and its pupils are not charged. Absent: no budget. Malformed, or no delegator.principal: every call is denied BUDGET_INVALID. Ledger unreadable or unsaveable: BUDGET_UNAVAILABLE.",
+      "required": [
+        "pupils"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "pupils": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Most distinct pupils (pseudo IDs, P0004) the mandate may ever name in a request or see in a result. A pupil already counted costs nothing again."
+        },
+        "calls": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Most calls forwarded to an MCP server, counted before forwarding, whatever they return (bounds probing with listing tools)."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Mandates from one issuer, for one delegator.principal, with the same id share one budget (e.g. a parent and a delegated child). Defaults to the mandate's jti. The ledger key is (iss, delegator.principal, id or jti), so another issuer or person picking the same id gets a separate budget."
+        }
+      }
     }
   }
 }

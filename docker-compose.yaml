@@ -53,6 +53,9 @@ services:
     environment:
       - MCP_SERVERS=pupil-data=http://backend:8080/mcp/
       - GATEWAY_STATE_DIR=/app/gateway/state
+      # the /demo walkthrough routes mint and revoke mandates with the issuer key: off unless GATEWAY_DEMO=1 in .env,
+      # for the local frontend walkthrough only, never on a deployed gateway
+      - GATEWAY_DEMO=${GATEWAY_DEMO:-0}
       - LITELLM_KEY=${LITELLM_KEY:-}
       - LITELLM_BASE_URL=${LITELLM_BASE_URL:-}
     healthcheck:

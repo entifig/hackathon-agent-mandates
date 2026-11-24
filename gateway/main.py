@@ -3,22 +3,37 @@
 POST /tools/call  {server, tool, arguments, mandate, nonce, ts, sig}
   -> verify mandate + proof of possession (gateway/lib/gateway_verify.py)
   -> ALLOW: forward to the MCP server, DENY: 403, STEP_UP: 202
+  -> a mandate with a `budget` claim (gateway/lib/budget.py): the request is charged before forwarding and the
+     result is checked before release; over budget is DENY BUDGET_EXHAUSTED, 403, and nothing is returned
+
+GATEWAY_DEMO=1 turns on the /demo walkthrough routes (404 otherwise). They hold the issuer key and an agent key, so
+anyone who can reach them can mint and revoke mandates: a deployed gateway runs with GATEWAY_DEMO unset or 0.
+
+Seen nonces (nonces.jsonl) and the budget ledger live in GATEWAY_STATE_DIR. If that dir is not writable, /healthcheck
+answers 503 with the reason so a bad deploy fails `docker compose up --wait` (calls are refused NONCE_UNAVAILABLE).
+Mandates without a budget never touch the ledger.
 """
 
+import dataclasses
 import json
+import logging
 import os
+import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Request as HTTPRequest
 from fastapi.responses import JSONResponse
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from gateway.cli import sign_request
+from gateway.lib.budget import ID_BOUNDED_TOOLS, Budget, Ledger, LedgerUnavailable, parse_budget, pupil_ids
 from gateway.lib.common import generate_keypair, pub_to_jwk
-from gateway.lib.gateway_verify import Gateway, Request
+from gateway.lib.gateway_verify import MAX_TS, Decision, Gateway, Request, normalised_arguments
+from gateway.lib.nonce_store import NonceStore
 from gateway.lib.trust_registry import TrustedList
 
 STATE_DIR = Path(os.environ.get("GATEWAY_STATE_DIR", "gateway/state"))
@@ -26,7 +41,10 @@ STATE_DIR = Path(os.environ.get("GATEWAY_STATE_DIR", "gateway/state"))
 MCP_SERVERS: dict[str, object] = dict(
     kv.split("=", 1) for kv in os.environ.get("MCP_SERVERS", "pupil-data=http://backend:8080/mcp/").split(",")
 )
+# the /demo routes answer only when this is "1" (off by default, also in docker-compose: see README to turn it on)
+DEMO = os.environ.get("GATEWAY_DEMO") == "1"
 state: dict = {}
+log = logging.getLogger("gateway")
 
 
 class CallBody(BaseModel):
@@ -35,16 +53,34 @@ class CallBody(BaseModel):
     arguments: dict
     mandate: str
     nonce: str
-    ts: int
+    ts: int = Field(ge=0, le=MAX_TS)
     sig: str
 
 
 def load_state(state_dir: Path) -> None:
     registry = TrustedList(json.loads((state_dir / "trusted_list.json").read_text()))
-    # shortcut: nonce replay set lives in Gateway._seen_nonces, in-memory per process; share it before multi-replica
-    state["gateway"] = Gateway(registry, status_lists={})
+    # [q11 replay] seen nonces persist in the state dir, so a restart does not reopen the replay window
+    # shortcut: one process; share the nonce store (and the ledger) before running more than one replica or worker
+    state["gateway"] = Gateway(registry, status_lists={}, nonces=NonceStore.load(state_dir / "nonces.jsonl"))
     state["status_uri"] = json.loads((state_dir / "status_list.json").read_text())["uri"]
     state["dir"] = state_dir
+    # run budgets survive a restart: usage is re-read here, so restarting does not hand out fresh budgets
+    state["ledger"] = Ledger.load(state_dir / "budget_ledger.json")
+    state["state_dir_error"] = state_dir_unwritable(state_dir)
+    if state["state_dir_error"]:
+        log.error("state dir not writable: %s; every call is refused NONCE_UNAVAILABLE", state["state_dir_error"])
+        state["ledger"].error = state["ledger"].error or state["state_dir_error"]
+
+
+def state_dir_unwritable(state_dir: Path) -> str | None:
+    """Why the budget ledger cannot be saved in `state_dir` (a probe file is created and removed), or None."""
+    try:
+        fd, probe = tempfile.mkstemp(dir=state_dir, prefix=".write_probe.")
+        os.close(fd)
+        Path(probe).unlink()
+    except OSError as e:
+        return f"GATEWAY_STATE_DIR {state_dir} is not writable ({type(e).__name__}: {e.strerror or e})"
+    return None
 
 
 @asynccontextmanager
@@ -56,8 +92,25 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="mandate gateway", lifespan=lifespan)
 
 
+@app.middleware("http")
+async def no_500(request: HTTPRequest, call_next):
+    """Anything the pipeline did not turn into a decision is still refused as JSON, never a 500 with a traceback."""
+    try:
+        return await call_next(request)
+    except Exception:
+        log.exception("unhandled error on %s", request.url.path)
+        return JSONResponse(
+            {"decision": {"decision": "DENY", "reason_code": "GATEWAY_ERROR"}, "error": "request not processed"},
+            status_code=400,
+        )
+
+
 @app.get("/healthcheck")
-def healthcheck() -> dict:
+def healthcheck():
+    # 503 fails `docker compose up --wait`: a gateway that cannot record nonces refuses every call
+    gateway = state.get("gateway")
+    if reason := state.get("state_dir_error") or (gateway and gateway.nonces.error):
+        return JSONResponse({"status": "error", "reason": reason}, status_code=503)
     return {"status": "ok"}
 
 
@@ -103,26 +156,104 @@ async def tools_call(body: CallBody):
     # re-read the published status list each request so `cli revoke` applies without a restart
     gateway.status_lists[state["status_uri"]] = (state["dir"] / "status_list.jwt").read_text().strip()
 
-    decision = gateway.decide(Request(**body.model_dump()))
+    decision, claims = gateway.decide_with_claims(Request(**body.model_dump()))
     record = decision.to_dict()
     # no audit trail: teams write their own decision record here (e.g. state["dir"] / "audit.jsonl")
 
     if decision.decision == "DENY":
         return JSONResponse({"decision": record}, status_code=403)
-    if decision.decision == "STEP_UP":
+    if decision.decision == "STEP_UP":  # not forwarded, so it costs no budget
         return JSONResponse({"decision": record}, status_code=202)
 
+    # [q11 path] forward exactly the arguments the scope check approved (the signature covered the original spelling)
+    body = body.model_copy(update={"arguments": normalised_arguments(body.arguments)})
     target = MCP_SERVERS.get(body.server)
     if target is None:
         raise HTTPException(404, f"no MCP server configured for {body.server!r}")
+    budget = parse_budget(claims)  # validated in decide: None or a well-formed budget
+    if budget is None:
+        return await _forward(target, body, record)
+    ledger: Ledger = state["ledger"]
+    # held across forward and charge, so two concurrent calls cannot both fit into the last of the budget
+    async with ledger.lock(budget.key):
+        return await _forward_budgeted(target, body, decision, budget, ledger)
+
+
+async def call_upstream(target, body: CallBody) -> tuple[bool, object]:
+    """(ok, result data or error text)."""
     try:
         async with Client(target) as client:
-            result = await client.call_tool(body.tool, body.arguments)
+            return True, (await client.call_tool(body.tool, body.arguments)).data
     except ToolError as e:
-        return JSONResponse({"decision": record, "error": str(e)}, status_code=502)
-    return {"decision": record, "result": result.data}
+        return False, str(e)
+
+
+async def _forward(target, body: CallBody, record: dict):
+    ok, payload = await call_upstream(target, body)
+    if ok:
+        return {"decision": record, "result": payload}
+    return JSONResponse({"decision": record, "error": payload}, status_code=502)
+
+
+def _pupils_detail(ledger: Ledger, budget: Budget, what: str) -> str:
+    used = len(ledger.usage(budget.key).pupils)
+    return f"pupils: {what}; {used} of {budget.pupils} distinct pupils used"
+
+
+def _admit(tool: str, named: set[str], budget: Budget, ledger: Ledger) -> tuple[str, str] | None:
+    """Charge a budgeted request before forwarding, or say why not as (reason_code, detail). Depends only on the
+    arguments and the ledger, never on the data, so a refusal is not an oracle (budget.py)."""
+    try:
+        ledger.check_available()
+        if not ledger.calls_left(budget):
+            return "BUDGET_EXHAUSTED", f"calls: all {budget.calls} used, not forwarded"
+        if not ledger.fits(budget, named):
+            new = len(ledger.new_pupils(budget, named))
+            return "BUDGET_EXHAUSTED", _pupils_detail(
+                ledger, budget, f"the {new} new pupil(s) named do not fit, not forwarded"
+            )
+        if tool not in ID_BOUNDED_TOOLS and ledger.full(budget):
+            only = f"budget full, only {sorted(ID_BOUNDED_TOOLS)} for pupils already seen; not forwarded"
+            return "BUDGET_EXHAUSTED", _pupils_detail(ledger, budget, only)
+        ledger.charge(budget, named, calls=1)  # persisted before forwarding: an error or a withheld result still costs
+    except LedgerUnavailable as e:
+        return "BUDGET_UNAVAILABLE", str(e)
+    return None
+
+
+async def _forward_budgeted(target, body: CallBody, decision: Decision, budget: Budget, ledger: Ledger):
+    """Charge the request, forward, then check the result (the backstop)."""
+
+    def refuse(code: str, detail: str) -> JSONResponse:
+        refusal = dataclasses.replace(decision, decision="DENY", reason_code=code, detail=detail)
+        return JSONResponse({"decision": refusal.to_dict(), "budget": ledger.report(budget)}, status_code=403)
+
+    # pupils the request names are charged whether or not they are found
+    if refusal := _admit(body.tool, pupil_ids(body.arguments), budget, ledger):
+        return refuse(*refusal)
+
+    ok, payload = await call_upstream(target, body)
+    # backstop for tools that list pupils without naming them (roster, get). An upstream error is upstream data too.
+    returned = pupil_ids(payload)
+    if not ledger.fits(budget, returned):
+        # says nothing about how many pupils the withheld result held: that would be a count oracle
+        withheld = "result withheld, it does not fit; its pupils were not charged"
+        return refuse("BUDGET_EXHAUSTED", _pupils_detail(ledger, budget, withheld))
+    try:
+        ledger.charge(budget, returned)
+    except LedgerUnavailable as e:
+        return refuse("BUDGET_UNAVAILABLE", str(e))
+    record = decision.to_dict()
+    if ok:
+        return {"decision": record, "result": payload, "budget": ledger.report(budget)}
+    return JSONResponse({"decision": record, "error": payload, "budget": ledger.report(budget)}, status_code=502)
+
+
+def _demo_enabled() -> None:
+    if not DEMO:
+        raise HTTPException(404, "Not Found")
 
 
 from gateway.demo import router as demo_router  # noqa: E402  (demo imports main lazily)
 
-app.include_router(demo_router)
+app.include_router(demo_router, dependencies=[Depends(_demo_enabled)])
