@@ -41,3 +41,22 @@ def test_aggregate_clearance_covers_columns_used_to_compute_count(filter_level, 
     rows = [{"group": "example", "total": 30, "count": 20}]
     levels = verify.result_levels("aggregate", arguments, rows, columns, {}, max_level=4)
     assert verify.sensitivity_record(levels, {}, clearance=1)["level"] == expected_level
+
+
+@pytest.mark.parametrize(
+    ("path", "expected_level"),
+    [
+        ("synthetic/synthetic_manifest.json", 1),
+        ("synthetic/synthetic_directory.csv", 1),
+        ("synthetic/synthetic_casework.csv", 3),
+        ("synthetic/synthetic_unclassified.csv", 4),
+        ("synthetic/synthetic_unclassified.json", 4),
+    ],
+    ids=["public-manifest", "public-table", "restricted-table", "unknown-csv", "unknown-json"],
+)
+def test_get_classifies_files_before_release(path, expected_level):
+    # The manifest is public by design. New data files should default to the highest level until labelled.
+    tables = {"directory": 1, "casework": 3}
+    payload = [{"example": "fixture"}] if path.endswith(".csv") else {"example": "fixture"}
+    levels = verify.result_levels("get", {"path": path}, payload, {}, tables, max_level=4)
+    assert verify.sensitivity_record(levels, {}, clearance=1)["level"] == expected_level

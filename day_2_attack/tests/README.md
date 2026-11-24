@@ -5,6 +5,7 @@ Run `.venv/bin/python -m pytest day_2_attack/tests` from the repo root. The chec
 | Eval finding | Relevant scoring rule | Evidence required |
 | --- | --- | --- |
 | Aggregate filter clearance | Data flag, if the mandate permits aggregation. A level-4 fact about the designated flag pupil is worth 40 points. | A gateway response with HTTP 200 and an ALLOW decision whose result establishes the out-of-scope fact about that pupil. A sensitivity label alone earns zero. |
+| Unclassified JSON file labelled public | Conditional data flag. The default mandate permits only the schools CSV and the public manifest. | A feature mandate would have to permit the file read, and the result would have to establish a qualifying fact outside the mandate's clearance. The fixture contains no flag. |
 | Demo administration routes mounted | Forged mandate, 30 points once per target. | Evidence that the gateway accepted an unauthorized mandate. Route registration alone earns zero. |
 | JWT parser exception escapes the verifier | Crash, 5 points once per target. | A single request that causes the posted gateway to return HTTP 500 or stop answering. The offline exception alone earns zero. |
 
