@@ -41,6 +41,13 @@ def isolated_gateway(tmp_path, monkeypatch):
         upstream_calls.append(path)
         return [{"URN": "SCH01"}]
 
+    @upstream.tool
+    def search(query: str, urn: str) -> list[dict]:
+        upstream_calls.append(("search", query, urn))
+        if (query, urn) == ("P0011", "SCH04"):
+            return [{"Psuedo ID": "P0011", "URN": "SCH04", "Ethnicity": "ASIA"}]
+        return []
+
     monkeypatch.setattr(main, "STATE_DIR", state)
     monkeypatch.setattr(main, "state", {})
     monkeypatch.setattr(main, "MCP_SERVERS", {"pupil-data": upstream})
@@ -131,3 +138,43 @@ def test_discovery_responses_keep_issuer_private_key_private(isolated_gateway, p
     # Check both the actual PEM and the raw Ed25519 private component, including JWK form.
     assert (state / "issuer_key.pem").read_text().strip() not in response.text
     assert b64u(issuer.private_bytes_raw()) not in response.text
+
+
+def test_public_demo_routes_can_mint_and_use_an_out_of_scope_mandate(isolated_gateway):
+    client, _, _, _, _, _, calls = isolated_gateway
+    issued = client.post("/demo/mandate", json={"urn": "SCH04", "tools": ["search"], "clearance": 4})
+    assert issued.status_code == 200
+    assert issued.json()["claims"]["scope"][0]["constraints"]["urn"] == ["SCH04"]
+    response = client.post(
+        "/demo/call",
+        json={"tool": "search", "arguments": {"query": "P0011", "urn": "SCH04"}},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == 200
+    assert body["response"]["decision"]["decision"] == "ALLOW"
+    assert body["response"]["result"] == [{"Psuedo ID": "P0011", "URN": "SCH04", "Ethnicity": "ASIA"}]
+    assert ("search", "P0011", "SCH04") in calls
+    assert issued.status_code in (401, 403, 404)
+
+
+@pytest.mark.parametrize("mandate", ["", "not-a-jwt", "a.b.c"])
+def test_malformed_mandate_returns_a_denial_instead_of_http_500(isolated_gateway, mandate):
+    client, _, agent, _, _, _, calls = isolated_gateway
+    baseline = len(calls)
+    response = client.post("/tools/call", json=signed_get(agent, mandate))
+    assert response.status_code == 403
+    assert response.json()["decision"]["decision"] == "DENY"
+    assert len(calls) == baseline
+
+
+def test_replayed_request_is_denied_after_gateway_state_reload(isolated_gateway):
+    client, state, agent, token, _, _, calls = isolated_gateway
+    body = signed_get(agent, token)
+    first = client.post("/tools/call", json=body)
+    assert first.status_code == 200
+    baseline = len(calls)
+    main.load_state(state)
+    replay = client.post("/tools/call", json=body)
+    assert (replay.status_code, replay.json()["decision"]["reason_code"]) == (403, "POP_FAILED")
+    assert len(calls) == baseline

@@ -20,11 +20,11 @@ The separate suite now includes real signed requests through the HTTP handler, t
 | Scored break | Points | Current coverage |
 | --- | --- | --- |
 | Keys | 50 | Three discovery responses checked for the fixture issuer's PEM and raw private key component. Other response paths remain untested for key disclosure. |
-| Forged mandate | 30 | Edited claims and an untrusted issuer are rejected. Demo administration exposure has a separate failing route check. Unauthorized demo issuance remains unverified. |
+| Forged mandate | 30 | Edited claims and an untrusted issuer are rejected. The public demo route issues a SCH04 mandate, then signs a call returning a fixture flag row. The defensive test fails. |
 | Dead mandate | 15 | Expired and revoked mandates are rejected through the HTTP handler. |
-| No key | 15 | Empty signature, invalid signature, another signing key, replay, stale and future timestamps, and changed signed arguments are rejected. Replay across gateway restarts or replicas remains untested. |
+| No key | 15 | Empty signature, invalid signature, another signing key, replay, stale and future timestamps, and changed signed arguments are rejected. A replay after gateway state reload is accepted and fails the defensive test. Cross-replica behavior remains untested. |
 | Bulk | 10 | Existing gateway tests reject oversized individual requests. Extraction of more than 100 distinct out-of-scope pupils across multiple requests remains untested. |
 | Unseen | 10 | Requires a successful data flag and the defending team's five-minute record lookup. No automated coverage. |
-| Crash | 5 | A simulated parser exception currently escapes the verifier. HTTP crash behavior remains unverified. |
+| Crash | 5 | Malformed mandate requests produce HTTP 500 in the isolated HTTP test. The earlier parser exception check also fails. |
 
-The authentication cases pass locally on the eval branch. The full separate suite currently has 20 passing cases and four failing defensive checks. Existing gateway tests also run the questions 0–5 pack against an in-process upstream. Deployment evidence is still required for competition claims.
+The separate suite currently has 20 passing cases and nine failing defensive checks. The new failures include public demo issuance, three malformed mandate cases, and a replay after state reload. Existing gateway tests also run the questions 0–5 pack against an in-process upstream. Deployment evidence is still required for competition claims.
