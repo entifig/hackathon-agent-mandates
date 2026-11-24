@@ -20,11 +20,18 @@ The separate suite now includes real signed requests through the HTTP handler, t
 | Scored break | Points | Current coverage |
 | --- | --- | --- |
 | Keys | 50 | Three discovery responses checked for the fixture issuer's PEM and raw private key component. Other response paths remain untested for key disclosure. |
-| Forged mandate | 30 | Edited claims and an untrusted issuer are rejected. The public demo route issues a SCH04 mandate, then signs a call returning a fixture flag row. The defensive test fails. |
+| Forged mandate | 30 | Edited claims and an untrusted issuer are rejected. The demo routes that could mint a SCH04 mandate answer 404 unless `GATEWAY_DEMO=1`. |
 | Dead mandate | 15 | Expired and revoked mandates are rejected through the HTTP handler. |
-| No key | 15 | Empty signature, invalid signature, another signing key, replay, stale and future timestamps, and changed signed arguments are rejected. A replay after gateway state reload is accepted and fails the defensive test. Cross-replica behavior remains untested. |
+| No key | 15 | Empty signature, invalid signature, another signing key, replay, stale and future timestamps, and changed signed arguments are rejected. A replay after gateway state reload is refused: nonces are kept in SQLite in the state dir. Replicas on separate hosts would still need a shared store. |
 | Bulk | 10 | Existing gateway tests reject oversized individual requests. Extraction of more than 100 distinct out-of-scope pupils across multiple requests remains untested. |
-| Unseen | 10 | Requires a successful data flag and the defending team's five-minute record lookup. No automated coverage. |
-| Crash | 5 | Malformed mandate requests produce HTTP 500 in the isolated HTTP test. The earlier parser exception check also fails. |
+| Unseen | 10 | Every decision is appended to `gateway/state/audit.jsonl` with the pupil IDs returned. Lookup: `grep -n '"P0011"' gateway/state/audit.jsonl`. |
+| Crash | 5 | Malformed mandates, a huge `ts` and an over-long nonce are refused with 403. Any other exception is a 403 `INTERNAL_ERROR`. |
 
-Rechecked after merging main at 21dda34. The aggregate filter test now passes. Eight defensive checks still fail, including public demo issuance with a fixture flag row, three malformed mandates returning HTTP 500, replay after state reload, demo route exposure, a parser exception, and unknown JSON classification. The existing gateway suite passes and includes the questions 0–5 pack against an in-process upstream. Deployment evidence is still required for competition claims.
+Rechecked on `sean-work` after the hardening changes. Every check now passes:
+
+- The demo routes are mounted only with `GATEWAY_DEMO=1`.
+- Malformed mandates and timestamps are refused with `MALFORMED` or `POP_FAILED`, and any other error with `INTERNAL_ERROR`.
+- Nonces live in `state/nonces.sqlite`, so a replay is refused after a reload.
+- Unlisted JSON files are labelled level 4.
+
+`gateway/tests` adds regression tests for checking clearance before the call (no refusal oracle), comma and short search queries, small-group suppression, the audit log, labels failing closed, and keeping the last good labels. Deployment evidence is still required for competition claims.

@@ -60,7 +60,7 @@ What we want at the end is what you found out: where agent mandates hold and whe
 3. Open **[questions/README.md](questions/README.md)**. It lists the questions, 0 to 16. Each starts with something the administrator asks.
 4. Read [gateway/lib/gateway_verify.py](gateway/lib/gateway_verify.py). It walks through the current verification process.
 
-Ports: MCP server `:8080`, gateway `:8082`, question board `localhost:8090`, demo UI `localhost:8081/demo` (a walkthrough of issuing a mandate and making a call - feel free to extend, e.g - for human in the loop escalation.). `make hack` and `make run` start all four.
+Ports: MCP server `:8080`, gateway `:8082`, question board `localhost:8090`, demo UI `localhost:8081/demo` (a walkthrough of issuing a mandate and making a call - feel free to extend, e.g - for human in the loop escalation.). `make hack` and `make run` start all four. The demo UI and the board's issuer and trust panels use the gateway's `/demo/*` routes. Those routes mint, sign and revoke mandates with no authentication, so they are off unless you start with `GATEWAY_DEMO=1 make run`. Never set `GATEWAY_DEMO` on a deployed gateway.
 `make test` and `make lint` run the tests and ruff. The data sources are listed in
 [mcp_server/data/synthetic/synthetic_manifest.json](mcp_server/data/synthetic/synthetic_manifest.json).
 

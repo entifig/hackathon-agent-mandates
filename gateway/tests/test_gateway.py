@@ -150,8 +150,27 @@ def test_tampered_mandate_is_denied(gw):
     assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "SIG_INVALID")
 
 
-def test_demo_walkthrough(gw):
+def test_demo_routes_are_off_unless_switched_on(gw):
     client, _, _ = gw
+    # minting, signing and revoking with no authentication: never on a gateway that is not switched to demo
+    assert not main.DEMO_ENABLED
+    for path in ("/demo/mandate", "/demo/call", "/demo/revoke"):
+        assert client.post(path, json={}).status_code == 404, path
+    assert client.get("/demo/issuer").status_code == 404
+    assert client.get("/docs").status_code == 404
+    assert client.get("/openapi.json").status_code == 404
+
+
+@pytest.mark.usefixtures("gw")
+def test_demo_walkthrough():
+    # the walkthrough mounts the demo router itself, as GATEWAY_DEMO=1 does for the local frontend
+    from fastapi import FastAPI  # noqa: PLC0415
+
+    from gateway.demo import router  # noqa: PLC0415
+
+    demo_app = FastAPI()
+    demo_app.include_router(router)
+    client = TestClient(demo_app)
     m = client.post("/demo/mandate", json={"urn": "SCH01"}).json()
     assert m["header"]["typ"] == "mandate+jwt"
     assert m["claims"]["scope"][0]["constraints"] == {"urn": ["SCH01"]}
@@ -574,6 +593,126 @@ def test_level_4_needs_a_role_the_gateway_lists(gw, tmp_path, monkeypatch):
     body = cli.sign_request(agent, server="pupil-data", tool="get", arguments={"path": ev.SCHOOLS}, mandate=token)
     r, _ = call(client, "get", body=body)
     assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "ROLE_INVALID")
+
+
+def _signed(agent, mandate, tool, **arguments):
+    return cli.sign_request(agent, server="pupil-data", tool=tool, arguments=arguments, mandate=mandate)
+
+
+def test_refusal_does_not_depend_on_whether_rows_matched(gw, tmp_path):
+    """Q6: clearance is decided before the call, so a refusal says nothing about the data."""
+    client, call, state = gw
+    agent = priv_from_pem((state / "agent.pem").read_bytes())
+    scope = [{"server": "pupil-data", "tools": ["search", "pupil"], "constraints": {"urn": ["SCH01"]}}]
+    mandate = _issue(state, tmp_path / "two.jwt", 2, scope)
+    # a pupil who is there and one who is not get the same answer, and neither call reaches the data
+    for query in (ev.PUPIL, "P9999"):
+        r, _ = call(client, "search", body=_signed(agent, mandate, "search", query=query, urn="SCH01"))
+        assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "CLEARANCE_TOO_LOW"), query
+        assert "the call could return" in r.json()["decision"]["detail"]
+    for pupil_id in (ev.PUPIL, "P9999"):
+        r, _ = call(client, "pupil", body=_signed(agent, mandate, "pupil", pupil_id=pupil_id, urn="SCH01"))
+        assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "CLEARANCE_TOO_LOW"), pupil_id
+
+
+def test_search_query_is_one_value_of_three_characters(gw):
+    client, call, _ = gw
+    for query in (",", "P0004,F", "P0004,F,WHIT", "P0", "ab"):
+        r, _ = call(client, "search", urn="SCH01", query=query)
+        assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "TOO_MUCH"), query
+    r, _ = call(client, "search", urn="SCH01", query="Y11")
+    assert r.status_code == 200
+
+
+def test_malformed_requests_are_refused_not_500(gw):
+    client, call, _ = gw
+
+    def b64(obj):
+        return cli.b64u(json.dumps(obj).encode())
+
+    header = b64({"typ": "mandate+jwt", "alg": "EdDSA"})
+    junk = {"server": "pupil-data", "tool": "search", "arguments": {"query": "SPR"}, "nonce": "n", "ts": 0, "sig": "x"}
+    for mandate in ("", "x", "a.b.c", f"{header}.{b64({})}.x", f"{header}.{b64({'iss': [1]})}.x"):
+        r = client.post("/tools/call", json={**junk, "mandate": mandate})
+        assert r.status_code == 403, mandate
+        assert r.json()["decision"]["decision"] == "DENY"
+    _, body = call(client, "search", query="SPR", urn="SCH01")
+    for ts in (10**400, -(10**400)):
+        r = client.post("/tools/call", json={**body, "ts": ts})
+        assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "POP_FAILED")
+    r = client.post("/tools/call", json={**body, "nonce": "n" * 129})
+    assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "POP_FAILED")
+
+
+def test_replay_is_refused_after_a_restart(gw):
+    client, call, state = gw
+    r, body = call(client, "search", query="SPR", urn="SCH01")
+    assert r.status_code == 200
+    main.load_state(state)  # a fresh Gateway, as after a restart or on another worker
+    r, _ = call(client, "search", body=body)
+    assert (r.status_code, r.json()["decision"]["reason_code"]) == (403, "POP_FAILED")
+
+
+def test_small_groups_are_withheld_not_just_rounded(gw, tmp_path):
+    client, call, state = gw
+    agent = priv_from_pem((state / "agent.pem").read_bytes())
+    mandate = _issue(state, tmp_path / "counts.jwt", 4, _COUNTS_SCOPE, ROLE)
+    # Greystone has one pupil in care, five census rows: rounding alone showed the group with total 0
+    r = _aggregate(
+        client,
+        call,
+        agent,
+        mandate,
+        group_by=["URN", "InCareAtCurrentSchool"],
+        measure="InCareAtCurrentSchool",
+        where={"URN": "SCH07"},
+    )
+    assert r.status_code == 200, r.text
+    assert [row["InCareAtCurrentSchool"] for row in r.json()["result"]] == ["0"]
+    assert "withheld" in r.json()["decision"]["detail"]
+    assert all(row["total"] >= 10 for row in r.json()["result"])
+
+
+def test_every_decision_is_audited_with_the_pupils_returned(gw):
+    client, call, state = gw
+    call(client, "search", query=ev.PUPIL, urn="SCH01")
+    call(client, "search", query="SPR", urn="SCH02")
+    lines = [json.loads(line) for line in (state / "audit.jsonl").read_text().splitlines()]
+    allowed, refused = lines[-2:]
+    assert (allowed["decision"], allowed["pupils"]) == ("ALLOW", [ev.PUPIL])
+    assert allowed["agent_id"]  # names the key, so the attacking team
+    assert "Ethnicity" in allowed["columns"]
+    assert (refused["decision"], refused["reason_code"], refused["pupils"]) == ("DENY", "CONSTRAINT_VIOLATED", [])
+
+
+def test_labels_fail_closed():
+    from gateway.lib.gateway_verify import result_levels  # noqa: PLC0415
+
+    columns = {"Ethnicity": 4, "URN": 1}
+    tables = {"schools": 1}
+
+    def level(tool, result, **arguments):
+        return max(result_levels(tool, arguments, result, columns, tables, 4).values(), default=0)
+
+    # shapes with no keys to read a label from
+    assert level("search", [["P0011", "ASIA"]]) == 4
+    assert level("search", "P0011 ASIA") == 4
+    assert level("search", [{"URN": {"Ethnicity": "ASIA"}}]) == 4
+    # special keys count only in the tool they belong to
+    assert level("search", [{"total": "ASIA"}]) == 4
+    assert level("search", [{"letter": "ASIA"}]) == 4
+    assert level("aggregate", [{"URN": "SCH01", "total": 30}], group_by=["URN"]) == 1
+    # only the manifest is a public non-CSV file
+    assert level("get", {"x": 1}, path="synthetic/synthetic_manifest.json") == 1
+    assert level("get", {"x": 1}, path="writes/corrections.jsonl") == 4
+
+
+def test_lost_labels_keep_the_last_good_copy(gw, monkeypatch):
+    client, call, _ = gw
+    monkeypatch.setattr(main, "_CLASSIFICATION_CANDIDATES", ["/no/such/manifest.json"])
+    r, _ = call(client, "get", path=ev.SCHOOLS)
+    assert r.status_code == 200, r.text
+    assert "FileNotFoundError" in main.state["labels_error"]
 
 
 def test_eval_set_passes_against_template_gateway(gw, tmp_path):

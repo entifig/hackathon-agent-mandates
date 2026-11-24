@@ -133,29 +133,26 @@ def test_unauthorized_mandates_are_denied_before_forwarding(isolated_gateway, at
 def test_discovery_responses_keep_issuer_private_key_private(isolated_gateway, path):
     client, state, _, _, _, _, _ = isolated_gateway
     response = client.get(path)
-    assert response.status_code == 200
+    # the demo routes are not mounted by default; when they are, they must still hide the key
+    assert response.status_code == (404 if path.startswith("/demo/") and not main.DEMO_ENABLED else 200)
     issuer = priv_from_pem((state / "issuer_key.pem").read_bytes())
     # Check both the actual PEM and the raw Ed25519 private component, including JWK form.
     assert (state / "issuer_key.pem").read_text().strip() not in response.text
     assert b64u(issuer.private_bytes_raw()) not in response.text
 
 
-def test_public_demo_routes_can_mint_and_use_an_out_of_scope_mandate(isolated_gateway):
+def test_public_demo_routes_cannot_mint_or_use_an_out_of_scope_mandate(isolated_gateway):
     client, _, _, _, _, _, calls = isolated_gateway
+    baseline = len(calls)
     issued = client.post("/demo/mandate", json={"urn": "SCH04", "tools": ["search"], "clearance": 4})
-    assert issued.status_code == 200
-    assert issued.json()["claims"]["scope"][0]["constraints"]["urn"] == ["SCH04"]
+    assert issued.status_code in (401, 403, 404)
     response = client.post(
         "/demo/call",
         json={"tool": "search", "arguments": {"query": "P0011", "urn": "SCH04"}},
     )
-    assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == 200
-    assert body["response"]["decision"]["decision"] == "ALLOW"
-    assert body["response"]["result"] == [{"Psuedo ID": "P0011", "URN": "SCH04", "Ethnicity": "ASIA"}]
-    assert ("search", "P0011", "SCH04") in calls
-    assert issued.status_code in (401, 403, 404)
+    assert response.status_code in (401, 403, 404)
+    assert client.post("/demo/revoke", json={"idx": 0}).status_code in (401, 403, 404)
+    assert len(calls) == baseline
 
 
 @pytest.mark.parametrize("mandate", ["", "not-a-jwt", "a.b.c"])

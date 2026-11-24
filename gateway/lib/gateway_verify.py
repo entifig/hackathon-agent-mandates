@@ -14,11 +14,13 @@ from __future__ import annotations
 import fnmatch
 import posixpath
 import time
+import zlib
 from dataclasses import asdict, dataclass
 
 import jwt
 
 from .common import canonical, jwk_thumbprint, jwk_to_pub, pub_to_pem, sha256_hex, verify_bytes
+from .nonce_store import MemoryNonces
 from .status_list import is_revoked
 
 POLICY_VERSION = "2026-11-18.1"
@@ -38,6 +40,23 @@ IDENTIFIERS = frozenset({"Psuedo ID", "DisplayName"})
 # replace the list; no mandate claim can.
 PRIVATE_LEVEL = 4
 PRIVATE_ROLES = frozenset({"safeguarding-lead"})
+# Files `get` may label below max_level without a table label. Any other non-CSV file is unlabelled, so level 4.
+PUBLIC_FILES = frozenset({"synthetic/synthetic_manifest.json"})
+# What each row-returning tool can hand back, by table (all its columns) or column name. The gateway decides
+# clearance from this before forwarding, so the answer cannot depend on what the data holds (question 6).
+# A tool missing here, and not handled in request_levels, is unlabelled and needs max_level.
+TOOL_RETURNS = {
+    "search": ("personal_data_school_census",),
+    "pupil": ("personal_data_school_census", "display_names", "personal_data_deprivation"),
+    "roster": ("Psuedo ID", "DisplayName"),
+    "draft": ("Psuedo ID", "letter"),
+}
+# Shortest search query: below this a substring matches most rows of the school.
+MIN_QUERY = 3
+# Longest nonce the gateway stores.
+MAX_NONCE = 128
+# Anything raised while parsing a hostile request is a refusal, never a 500.
+_MALFORMED = (jwt.PyJWTError, KeyError, TypeError, ValueError, OverflowError, AttributeError)
 
 
 class Reject(Exception):
@@ -96,10 +115,13 @@ def verify_mandate(token: str, registry, status_lists: dict[str, str]) -> dict:
     if hdr.get("typ") != "mandate+jwt":
         raise Reject("WRONG_TOKEN_TYPE", hdr.get("typ"))
     unverified = jwt.decode(token, options={"verify_signature": False})
+    iss, kid = unverified.get("iss"), hdr.get("kid", "")
+    if not isinstance(iss, str) or not isinstance(kid, str):
+        raise Reject("MALFORMED", "iss and kid must be strings")
 
-    pub = registry.issuer_key(unverified["iss"], hdr.get("kid", ""))
+    pub = registry.issuer_key(iss, kid)
     if pub is None:
-        raise Reject("ISSUER_NOT_ACCREDITED", unverified["iss"])
+        raise Reject("ISSUER_NOT_ACCREDITED", iss)
     try:
         claims = jwt.decode(token, pub_to_pem(pub), algorithms=["EdDSA"],
                             options={"verify_exp": False, "verify_nbf": False, "require": ["exp", "iss", "jti"]})
@@ -119,7 +141,8 @@ def verify_mandate(token: str, registry, status_lists: dict[str, str]) -> dict:
     try:
         if is_revoked(sl_jwt, sl["idx"], pub, sl["uri"]):
             raise Reject("REVOKED", claims["jti"])
-    except ValueError as e:
+    except (ValueError, KeyError, TypeError, jwt.PyJWTError, zlib.error) as e:
+        # a stale, forged or half-written list fails closed
         raise Reject("STATUS_UNAVAILABLE", str(e))
     return claims
 
@@ -177,8 +200,16 @@ def check_request(req: Request, scope: list[dict], deny: list[str], step_up_patt
         if type(limit) is not int or not 0 <= limit <= MAX_ROWS:
             return "DENY", "TOO_MUCH", f"limit={limit!r}, at most {MAX_ROWS}"
         # An empty search matches every row of the granted school. Question 0 searches all have a query.
-        if req.tool == "search" and not str(req.arguments.get("query", "")).strip():
-            return "DENY", "TOO_MUCH", "empty query matches every row"
+        if req.tool == "search":
+            query = str(req.arguments.get("query", "")).strip()
+            if not query:
+                return "DENY", "TOO_MUCH", "empty query matches every row"
+            # rows are matched as one comma-joined string: a comma matches every row, and a query with commas
+            # tests several columns at once ("P0011,F,ASIA")
+            if "," in query:
+                return "DENY", "TOO_MUCH", "a query may not contain a comma"
+            if len(query) < MIN_QUERY:
+                return "DENY", "TOO_MUCH", f"query must be at least {MIN_QUERY} characters"
         named = _identifiers(req.arguments) if req.tool == "aggregate" else []
         if named:
             return "DENY", "TOO_FINE", f"{named[0]} makes each group one pupil"
@@ -209,25 +240,90 @@ def result_max_level(tool: str, arguments: dict, result, columns: dict[str, int]
     return max(result_levels(tool, arguments, result, columns, tables, max_level).values(), default=0)
 
 
+UNLABELLED = "(unlabelled value)"
+
+
+def _filter_levels(tool: str, arguments: dict, columns: dict[str, int], max_level: int) -> dict[str, int]:
+    where = arguments.get("where") if tool == "aggregate" else None
+    if where is None:
+        return {}
+    if not isinstance(where, dict):
+        return {"where (filter)": max_level}
+    # a count of one ethnic group says as much about ethnicity as grouping by it, with or without rows
+    return {f"{k} (filter)": columns.get(str(k), max_level) for k in where}
+
+
 def result_levels(tool: str, arguments: dict, result, columns: dict[str, int],
                   tables: dict[str, int], max_level: int) -> dict[str, int]:
-    """Each labelled part of the result and its level: a column, or the whole table for `get`."""
+    """Each labelled part of the result and its level: a column, or the whole table for `get`.
+
+    Fails closed: a value with no label, a row that is not a flat dict, or a file not listed is max_level.
+    """
     if result is None:
         return {}
     if tool == "get":
         path = _norm_path(str(arguments.get("path", "")))
         if not path.endswith(".csv"):
-            return {path: 1}
+            return {path: 1 if path in PUBLIC_FILES else max_level}
         stem = path.rsplit("/", 1)[-1].removeprefix("synthetic_").removesuffix(".csv")
         return {stem: tables.get(stem, max_level)}
     rows = result if isinstance(result, list) else [result]
-    levels = {_key_name(k, arguments): _key_level(k, arguments, columns, max_level)
-              for r in rows if isinstance(r, dict) for k in r}
-    where = arguments.get("where") if tool == "aggregate" else None
-    if isinstance(where, dict):
-        # a count of one ethnic group says as much about ethnicity as grouping by it, with or without rows
-        levels.update({f"{k} (filter)": columns.get(k, max_level) for k in where})
+    levels: dict[str, int] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            levels[UNLABELLED] = max_level              # a bare string or list: nothing to read a label from
+            continue
+        for key, value in row.items():
+            name = _key_name(tool, str(key), arguments)
+            level = max_level if isinstance(value, (dict, list)) else _key_level(
+                tool, str(key), arguments, columns, max_level)
+            levels[name] = max(levels.get(name, 0), level)
+    levels.update(_filter_levels(tool, arguments, columns, max_level))
     return levels
+
+
+def request_levels(tool: str, arguments: dict, columns: dict[str, int], tables: dict[str, int],
+                   table_columns: dict[str, dict], max_level: int) -> dict[str, int]:
+    """Everything the call could return, labelled before it runs (question 6).
+
+    Deciding on the result alone turns the decision into an oracle: an empty result is allowed and a matching
+    one refused, so the refusal says what the rows hold. Labels use the same names as result_levels.
+    """
+    if tool == "get":
+        return result_levels("get", arguments, [], columns, tables, max_level)
+    if tool == "aggregate":
+        group_by, measure = arguments.get("group_by", []), str(arguments.get("measure", ""))
+        if not isinstance(group_by, list):
+            return {"group_by": max_level}
+        levels = {str(g): columns.get(str(g), max_level) for g in group_by}
+        levels.update({"total": 1, f"count ({measure})": columns.get(measure, max_level)})
+        levels.update(_filter_levels(tool, arguments, columns, max_level))
+        return levels
+    if tool == "write":
+        column = str(arguments.get("column", ""))
+        level = columns.get(column, max_level)
+        return {f"before ({column})": level, f"after ({column})": level}
+    parts = TOOL_RETURNS.get(tool)
+    if parts is None:
+        return {f"{tool} (no declared result)": max_level}
+    levels = {}
+    for part in parts:
+        names = table_columns.get(part, {part: None})
+        for name in names:
+            levels[name] = _key_level(tool, name, arguments, columns, max_level)
+    return levels
+
+
+def suppress_small_groups(result, base: int) -> tuple[list | object, int]:
+    """Drop every aggregate group of fewer than base rows. Returns (rows kept, groups dropped).
+
+    Rounding alone is not enough: a group shown with total 0 still says at least one pupil has that combination.
+    """
+    if not isinstance(result, list):
+        return result, 0
+    kept = [row for row in result if not (isinstance(row, dict) and type(row.get("total")) is int
+                                          and row["total"] < base)]
+    return kept, len(result) - len(kept)
 
 
 def round_counts(result, base: int):
@@ -256,23 +352,33 @@ def sensitivity_record(levels: dict[str, int], level_names: dict[int, str], clea
     }
 
 
-def _key_name(key: str, arguments: dict) -> str:
-    if key == "count":
+# Result keys that are not columns, and the one tool each belongs to. In any other tool's result they are looked
+# up like any column, so a server cannot launder data through a key called "total".
+_SPECIAL_KEYS = {"total": "aggregate", "count": "aggregate", "before": "write", "after": "write", "letter": "draft"}
+
+
+def _special(tool: str, key: str) -> bool:
+    return _SPECIAL_KEYS.get(key) == tool
+
+
+def _key_name(tool: str, key: str, arguments: dict) -> str:
+    if _special(tool, key) and key == "count":
         return f"count ({arguments.get('measure', '')})"
-    if key in ("before", "after"):
+    if _special(tool, key) and key in ("before", "after"):
         return f"{key} ({arguments.get('column', '')})"
     return key
 
 
-def _key_level(key: str, arguments: dict, columns: dict[str, int], max_level: int) -> int:
-    if key == "total":                                 # aggregate group size
-        return 1
-    if key == "count":                                 # aggregate: how many match `measure`
-        return columns.get(str(arguments.get("measure", "")), max_level)
-    if key in ("before", "after"):                     # write result echoes the corrected column
-        return columns.get(str(arguments.get("column", "")), max_level)
-    if key == "letter":                                # draft text embeds a display name
-        return 2
+def _key_level(tool: str, key: str, arguments: dict, columns: dict[str, int], max_level: int) -> int:
+    if _special(tool, key):
+        if key == "total":                             # aggregate group size
+            return 1
+        if key == "count":                             # aggregate: how many match `measure`
+            return columns.get(str(arguments.get("measure", "")), max_level)
+        if key in ("before", "after"):                 # write result echoes the corrected column
+            return columns.get(str(arguments.get("column", "")), max_level)
+        if key == "letter":                            # draft text embeds a display name
+            return 2
     return columns.get(key, max_level)
 
 
@@ -289,11 +395,13 @@ def no_clearance_notice(claims: dict, req: Request) -> str:
 # ---------------------------------------------------------------- the pipeline
 
 class Gateway:
-    def __init__(self, registry, status_lists: dict[str, str], step_up_patterns: list[str] | None = None):
+    def __init__(self, registry, status_lists: dict[str, str], step_up_patterns: list[str] | None = None,
+                 nonces=None):
         self.registry = registry
         self.status_lists = status_lists
         self.step_up = step_up_patterns or ["*.write", "*.draft"]
-        self._seen_nonces: set[str] = set()
+        # main.py passes a SQLite store in the state dir, so a replay fails after a restart and across workers
+        self.nonces = nonces if nonces is not None else MemoryNonces()
 
     def decide(self, req: Request) -> Decision:
         base = dict(policy_version=POLICY_VERSION, mandate_hash=sha256_hex(req.mandate.encode()),
@@ -301,13 +409,16 @@ class Gateway:
         try:
             claims = verify_mandate(req.mandate, self.registry, self.status_lists)
             jwk = claims["cnf"]["jwk"]
-            if abs(req.ts - time.time()) > 300:
+            now = int(time.time())  # int minus int: a huge ts cannot overflow a float
+            if type(req.ts) is not int or abs(req.ts - now) > 300:
                 raise Reject("POP_FAILED", "request timestamp outside window")
-            if req.nonce in self._seen_nonces:
-                raise Reject("POP_FAILED", "replayed nonce")
+            if not isinstance(req.nonce, str) or not 0 < len(req.nonce) <= MAX_NONCE:
+                raise Reject("POP_FAILED", f"nonce must be 1-{MAX_NONCE} characters")
             if not verify_bytes(jwk_to_pub(jwk), req.signing_input(), req.sig):
                 raise Reject("POP_FAILED", f"bad signature for jkt {jwk_thumbprint(jwk)}")
-            self._seen_nonces.add(req.nonce)
+            # claimed only once the signature holds, so junk requests cannot fill the store
+            if not self.nonces.claim(req.nonce, now):
+                raise Reject("POP_FAILED", "replayed nonce")
 
             # Question 6: no clearance claim is an error, not an assumption. The caller
             # fixes the mandate (re-issue with --claims '{"clearance": N}'), not the gateway.
@@ -327,3 +438,6 @@ class Gateway:
                             detail=detail, **base)
         except Reject as r:
             return Decision("DENY", r.code, agent_id=None, detail=r.detail, **base)
+        except _MALFORMED as e:
+            # not a JWT, a claim of the wrong type, a ts too large for a float: refused, never a 500
+            return Decision("DENY", "MALFORMED", agent_id=None, detail=type(e).__name__, **base)
