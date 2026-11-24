@@ -297,6 +297,34 @@ def request_levels(tool: str, arguments: dict, table_columns: dict[str, dict[str
     return levels
 
 
+def release_counts(result, base: int) -> tuple[object, int, int]:
+    """Aggregate rows as released: (rows, groups withheld, counts hidden).
+
+    Rounding alone is not disclosure control:
+    - a group shown at all says someone has that combination, even with total rounded to 0, so a group of fewer
+      than base rows is withheld;
+    - a count below base, or within base of its total, is hidden (None), because rounding halves up and one pupil's
+      five census rows would read 10. Zero is hidden too, so None cannot be read as "1 to 9".
+    The rest are rounded, as before, so two answers cannot be subtracted.
+    """
+    if not isinstance(result, list):
+        return result, 0, 0
+    rows, withheld, hidden = [], 0, 0
+    for row in result:
+        if not isinstance(row, dict):
+            rows.append(row)
+            continue
+        total, count = row.get("total"), row.get("count")
+        if type(total) is int and total < base:
+            withheld += 1
+            continue
+        if type(total) is int and type(count) is int and (count < base or total - count < base):
+            row = {**row, "count": None}
+            hidden += 1
+        rows.append(row)
+    return round_counts(rows, base), withheld, hidden
+
+
 def round_counts(result, base: int):
     """Every aggregate total and count to the nearest multiple of base, halves up."""
     if not isinstance(result, list):
@@ -364,6 +392,7 @@ class Gateway:
         # nonce digest -> the time its request leaves the window, after which a replay fails on ts anyway
         self._seen_nonces: dict[str, int] = {}
         self._nonce_log = nonce_log
+        self._nonce_offset = 0  # bytes of the log already read, so a check reads only what others appended since
         if nonce_log is not None:
             self._load_nonces(nonce_log)
 
@@ -379,6 +408,33 @@ class Gateway:
                 self._seen_nonces[digest] = int(expires)
         # written at start-up so a state dir that cannot be written fails here, not in the middle of a call
         log.write_text("".join(f"{expires} {digest}\n" for digest, expires in self._seen_nonces.items()))
+        self._nonce_offset = log.stat().st_size
+
+    def _sync_nonces(self) -> None:
+        """Pick up nonces another live instance sharing the log has accepted since this one last looked.
+
+        Reads only complete lines past the last offset. If the log got shorter (another instance trimmed it at its
+        start-up), reads it again from the top. shortcut: two instances accepting the same nonce in the same
+        instant can both pass; a lock or a shared store with a unique key closes that.
+        """
+        log = self._nonce_log
+        if log is None:
+            return
+        try:
+            if log.stat().st_size < self._nonce_offset:
+                self._nonce_offset = 0
+            with log.open("rb") as f:
+                f.seek(self._nonce_offset)
+                chunk = f.read()
+        except OSError:
+            return
+        complete = chunk.rfind(b"\n") + 1
+        now = int(time.time())
+        for line in chunk[:complete].decode("ascii", errors="ignore").splitlines():
+            expires, _, digest = line.partition(" ")
+            if expires.isdigit() and digest and int(expires) >= now:
+                self._seen_nonces[digest] = int(expires)
+        self._nonce_offset += complete
 
     def _remember_nonce(self, digest: str, expires: int) -> None:
         self._seen_nonces[digest] = expires
@@ -401,6 +457,7 @@ class Gateway:
             jwk = claims["cnf"]["jwk"]
             if abs(req.ts - int(time.time())) > REPLAY_WINDOW:      # whole seconds: a huge ts must not overflow
                 raise Reject("POP_FAILED", "request timestamp outside window")
+            self._sync_nonces()  # another instance on the same state dir may have accepted it
             if nonce in self._seen_nonces:
                 raise Reject("POP_FAILED", "replayed nonce")
             if not verify_bytes(jwk_to_pub(jwk), req.signing_input(), req.sig):

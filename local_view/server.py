@@ -12,9 +12,11 @@ The hackathon walkthrough in frontend/ is left as it shipped.
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import re
+import secrets
 import sys
 import urllib.error
 import urllib.request
@@ -32,6 +34,18 @@ from questions import catalog, execute, execute_all, labels_in_force, mandates  
 STATE = ROOT / "gateway" / "state"
 PAGE = Path(__file__).with_name("index.html")
 ATTACK_PAGE = Path(__file__).with_name("attack.html")
+# Every POST runs signed calls with our issuer and agent keys, so it needs this token. The board's own pages carry
+# it; a request without it (another local process, or another site making the browser post to 127.0.0.1) is
+# refused. The custom header also forces a CORS preflight, which this server never grants. New on each start.
+BOARD_TOKEN = os.environ.get("BOARD_TOKEN") or secrets.token_urlsafe(24)
+TOKEN_HEADER = "x-board-token"  # noqa: S105  (a header name, not a secret)
+
+
+def _page(path: Path) -> str:
+    meta = f'<meta name="board-token" content="{BOARD_TOKEN}">'
+    return path.read_text().replace("</head>", f"{meta}\n</head>", 1)
+
+
 GATEWAY = os.environ.get("GATEWAY_URL", "http://127.0.0.1:8082")
 MCP = os.environ.get("MCP_URL", "http://127.0.0.1:8080")
 HOST = os.environ.get("BOARD_HOST", "127.0.0.1")
@@ -152,9 +166,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
         if path in ("/", "/index.html"):
-            self._send(HTTP_OK, PAGE.read_text(), "text/html; charset=utf-8")
+            self._send(HTTP_OK, _page(PAGE), "text/html; charset=utf-8")
         elif path in ("/attack", "/attack.html"):
-            self._send(HTTP_OK, ATTACK_PAGE.read_text(), "text/html; charset=utf-8")
+            self._send(HTTP_OK, _page(ATTACK_PAGE), "text/html; charset=utf-8")
         elif path in GET_ROUTES:
             self._answer(GET_ROUTES[path])
         else:
@@ -162,6 +176,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
+        if not hmac.compare_digest(self.headers.get(TOKEN_HEADER, ""), BOARD_TOKEN):
+            self._send(403, {"error": "board token missing or wrong: reload the board page"})
+            return
         one = RUN_ONE.match(path)
         if one:
             self._answer(lambda: execute(int(one.group(1)), _gateway_post))
