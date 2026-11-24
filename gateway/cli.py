@@ -8,6 +8,8 @@ never do, and until when. The gateway checks the note on every call. The issuer 
     python -m gateway.cli issue --agent-key team.jwk -o mandate.jwt # issuer: write a mandate for that key
     python -m gateway.cli discover --url http://localhost:8082      # agent: see what a gateway offers
     python -m gateway.cli revoke --idx 0                            # issuer: cancel mandate 0
+    python -m gateway.cli delegate --mandate mandate.jwt --agent-key agent.pem --helper-key helper.jwk \\
+        --scope '[...]' -o child.jwt                                # agent: hand a helper less than it holds
     python -m gateway.cli decode mandate.jwt                        # anyone: read what a mandate says
     python -m gateway.cli audit --pupil P0011                       # operator: who was sent this pupil's data?
     python -m gateway.cli call --mandate gateway/state/mandate.jwt --agent-key gateway/state/agent.pem \\
@@ -17,6 +19,7 @@ Keys and mandates live in $GATEWAY_STATE_DIR (default gateway/state). It holds p
 """
 
 import argparse
+import contextlib
 import json
 import os
 import secrets
@@ -25,7 +28,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-from gateway.lib import audit
+from gateway.lib import audit, delegation
 from gateway.lib.common import (
     b64u,
     b64u_decode,
@@ -208,10 +211,38 @@ def cmd_revoke(a) -> None:
     print(f"revoked idx {a.idx}")
 
 
+def _claims(token: str) -> dict:
+    return json.loads(b64u_decode(token.strip().split(".")[1]))
+
+
 def cmd_decode(a) -> None:
     # reads the claims only: the signature is not checked here, the gateway does that on every call
-    payload = (a.mandate or a.state / "mandate.jwt").read_text().split(".")[1]
-    print(json.dumps(json.loads(b64u_decode(payload)), indent=2))
+    claims = _claims((a.mandate or a.state / "mandate.jwt").read_text())
+    if isinstance(claims.get("parent"), str):  # a delegated child: show what it was handed on from, decoded
+        with contextlib.suppress(ValueError, IndexError):
+            claims["parent"] = _claims(claims["parent"])
+    print(json.dumps(claims, indent=2))
+
+
+def cmd_delegate(a) -> None:
+    try:
+        token = delegation.delegate(
+            a.mandate.read_text().strip(),
+            priv_from_pem(a.agent_key.read_bytes()),
+            load_agent_pub(a.helper_key),
+            scope=json.loads(a.scope),
+            deny=json.loads(a.deny),
+            ttl=a.ttl,
+            budget=json.loads(a.budget) if a.budget else None,
+            check=not a.no_check,
+        )
+    except ValueError as e:
+        sys.exit(f"not delegated: {e}")
+    if a.out:
+        a.out.write_text(token)
+        print(f"wrote delegated mandate {_claims(token)['jti']} to {a.out}")
+    else:
+        print(token)
 
 
 def cmd_call(a) -> None:
@@ -237,10 +268,11 @@ def cmd_call(a) -> None:
 def _audit_line(e: dict) -> str:
     d, m, r = e.get("decision") or {}, e.get("mandate") or {}, e.get("released") or {}
     args = json.dumps(e.get("arguments"), ensure_ascii=False, separators=(",", ":"))
+    parent = f" parent={m.get('parent_jti')}" if m.get("delegated") else ""  # [q7] a helper's call
     line = (
         f"#{e.get('seq')} {e.get('at')} {d.get('decision')} {d.get('reason_code')}"
         f"{'' if m.get('verified') else ' UNVERIFIED'} {m.get('principal')}"
-        f" jti={m.get('jti')} idx={m.get('status_idx')}"
+        f" jti={m.get('jti')}{parent} idx={m.get('status_idx')}"
         f" jkt={(m.get('jkt') or '')[:10]} from={(e.get('client') or {}).get('addr')}"
         f" {e.get('server')}.{e.get('tool')} {args} -> {e.get('status')}"
     )
@@ -291,6 +323,23 @@ def add_audit_parser(sub) -> None:
     s.set_defaults(fn=cmd_audit)
 
 
+def add_delegate_parser(sub) -> None:
+    s = sub.add_parser(
+        "delegate",
+        help="hand a helper agent a narrower child of your mandate, signed with your agent key (no issuer needed)",
+    )
+    s.add_argument("--mandate", type=Path, required=True, help="your (parent) mandate")
+    s.add_argument("--agent-key", type=Path, required=True, help="your private key: the parent mandate's cnf key")
+    s.add_argument("--helper-key", type=Path, required=True, help="the helper's public key (JWK or PEM)")
+    s.add_argument("--scope", required=True, help="what the helper may do (JSON); must be inside the parent's scope")
+    s.add_argument("--deny", default="[]", help="deny rules to add (JSON); the parent's are always kept")
+    s.add_argument("--ttl", type=int, default=3600, help="seconds until it expires; never later than the parent")
+    s.add_argument("--budget", help="a run budget no bigger than the parent's, e.g. '{\"pupils\": 38}' (JSON)")
+    s.add_argument("--no-check", action="store_true", help="skip the local narrower check (to test a gateway)")
+    s.add_argument("-o", "--out", type=Path, help="file to write to (default: print it)")
+    s.set_defaults(fn=cmd_delegate)
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument(
@@ -330,6 +379,8 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("revoke", help="cancel a mandate; takes effect on the next call")
     s.add_argument("--idx", type=int, required=True, help="number printed when it was issued")
     s.set_defaults(fn=cmd_revoke)
+
+    add_delegate_parser(sub)
 
     s = sub.add_parser("decode", help="print a mandate's claims as JSON, without checking its signature")
     s.add_argument("mandate", type=Path, nargs="?", help="the mandate file (default: mandate.jwt in --state)")

@@ -24,6 +24,11 @@ budgeted mandate is charged on its REQUEST, before forwarding, from the argument
      IDs it names, go through;
   5. the call is counted (and persisted) before forwarding.
 
+A delegated child (question 7, delegation.py) is charged to EVERY budget in its chain (`chain_budgets`): its own, if
+it carries one (keyed by the gateway as "delegated:<parent jti>:<child jti>", never an id the child picks), and its
+parent's. A call goes through only if it fits all of them, so a helper is not a way round the parent's budget, and the
+helper's pupils count against the parent's run.
+
 The result is still scanned as a backstop for tools that list pupils without naming them (`roster`, `get`): a result
 that would take the mandate past `pupils` is withheld whole and its pupils are not charged.
 
@@ -38,6 +43,7 @@ shortcut: a missing ledger file is read as a first run (empty). Deleting it whil
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import re
@@ -72,6 +78,7 @@ class Budget:
     pupils: int
     calls: int | None
     key: Key
+    label: str = "mandate"  # "mandate", or for a delegated child "child" / "parent": named in refusals
 
 
 def _count(raw: dict, name: str) -> int:
@@ -104,6 +111,20 @@ def parse_budget(claims: dict) -> Budget | None:
     if not isinstance(iss, str):
         raise BudgetInvalid("iss must be a string")
     return Budget(pupils=_count(raw, "pupils"), calls=calls, key=(iss, principal, budget_id))
+
+
+def chain_budgets(claims: dict) -> list[Budget]:
+    """Every budget a call under these verified claims is charged to, own first. An ordinary mandate: its budget,
+    if any. A delegated child (gateway-built claims with the verified parent under `parent`): its own and its
+    parent's, so a helper cannot spend outside the parent's budget. Raises BudgetInvalid."""
+    own = parse_budget(claims)
+    parent = claims.get("parent")
+    if not isinstance(parent, dict):  # verify_mandate refuses an issuer-signed `parent`: only a child has one
+        return [own] if own else []
+    budgets = [dataclasses.replace(own, label="child")] if own else []
+    if parent_budget := parse_budget(parent):
+        budgets.append(dataclasses.replace(parent_budget, label="parent"))
+    return budgets
 
 
 def request_refusal(tool: str, arguments: dict) -> str | None:
@@ -199,13 +220,16 @@ class Ledger:
     def full(self, budget: Budget) -> bool:
         return len(self.usage(budget.key).pupils) >= budget.pupils
 
-    def charge(self, budget: Budget, ids: set[str], calls: int = 0) -> None:
-        """Add `ids` and `calls` to the usage and save. The caller checked `fits` first."""
-        used = self.usage(budget.key)
-        if not calls and ids <= used.pupils:
+    def charge(self, budget: Budget | list[Budget], ids: set[str], calls: int = 0) -> None:
+        """Add `ids` and `calls` to the usage of each budget (each ledger key once) and save once. The caller checked
+        `fits` first."""
+        keys = list(dict.fromkeys(b.key for b in (budget if isinstance(budget, list) else [budget])))
+        if not calls and all(ids <= self.usage(key).pupils for key in keys):
             return  # nothing new: no write
-        used.calls += calls
-        used.pupils |= ids
+        for key in keys:
+            used = self.usage(key)
+            used.calls += calls
+            used.pupils |= ids
         self.save()
 
     def report(self, budget: Budget) -> dict:

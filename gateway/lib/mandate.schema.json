@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:hack:mandate:v1",
   "title": "Agentic mandate (JWT claims set)",
-  "description": "Claims carried in an EdDSA-signed JWT (typ: mandate+jwt). Documentation only: the gateway reads the `required` claims and ignores the rest.",
+  "description": "Claims carried in an EdDSA-signed JWT (typ: mandate+jwt). Documentation only: the gateway reads the `required` claims and ignores the rest. A mandate may be handed on to a helper agent as a narrower delegated child (question 7, gateway/lib/delegation.py): see $defs.delegated.",
   "type": "object",
   "required": [
     "iss",
@@ -179,7 +179,94 @@
         "id": {
           "type": "string",
           "minLength": 1,
-          "description": "Mandates from one issuer, for one delegator.principal, with the same id share one budget (e.g. a parent and a delegated child). Defaults to the mandate's jti. The ledger key is (iss, delegator.principal, id or jti), so another issuer or person picking the same id gets a separate budget."
+          "description": "Mandates from one issuer, for one delegator.principal, with the same id share one budget. Defaults to the mandate's jti. The ledger key is (iss, delegator.principal, id or jti), so another issuer or person picking the same id gets a separate budget. A delegated child may not set id: the gateway keys a child's own budget itself, and charges every child call to its parent's budget as well."
+        }
+      }
+    },
+    "parent": {
+      "not": {},
+      "description": "Reserved (question 7). An issuer-signed mandate carrying `parent` is refused (403 MANDATE_MALFORMED), so `parent` only ever appears in a delegated child ($defs.delegated), never in a mandate the issuer signed."
+    }
+  },
+  "$defs": {
+    "delegated": {
+      "title": "Delegated child mandate (JWT claims set)",
+      "description": "Question 7: a narrower mandate the holder of a parent mandate hands to a helper agent, made with `cli delegate`. JWT header typ: delegated-mandate+jwt, kid: the parent's cnf thumbprint. Signed (EdDSA) with the PARENT mandate's cnf key, not by an issuer. On every call the gateway verifies the embedded parent in full (issuer, signature, time, revocation: a failure keeps the parent's own reason code, detail 'parent mandate: ...'), then the child's signature against the parent's cnf key, then that the child is no wider than the parent (403 DELEGATION_WIDER), then the request against the child's scope and deny, then against the parent's again. delegator, purpose and status are inherited from the parent and may not be set. Depth is 1: a child's parent may not itself be a child. A child may not grant server 'gateway' (the request log). Every child call is charged to the parent's budget, and to the child's own when it has one. Any other claim, or a claim of the wrong shape: 403 DELEGATION_INVALID. Gateways without this feature refuse the typ (WRONG_TOKEN_TYPE).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "iss",
+        "jti",
+        "nbf",
+        "exp",
+        "vct",
+        "parent",
+        "cnf",
+        "agent_id",
+        "scope",
+        "deny"
+      ],
+      "properties": {
+        "iss": {
+          "type": "string",
+          "pattern": "^urn:ietf:params:oauth:jwk-thumbprint:sha-256:",
+          "description": "RFC 9278 URI of the parent's cnf key thumbprint: the key that signed this child."
+        },
+        "jti": {
+          "type": "string",
+          "description": "Unique child id (urn:uuid:...). Audit entries carry the chain [parent jti, child jti]."
+        },
+        "iat": {
+          "type": "integer"
+        },
+        "nbf": {
+          "type": "integer",
+          "description": "No earlier than the parent's nbf."
+        },
+        "exp": {
+          "type": "integer",
+          "description": "No later than the parent's exp."
+        },
+        "vct": {
+          "const": "urn:hack:mandate:delegated:v1"
+        },
+        "parent": {
+          "type": "string",
+          "description": "The parent mandate as a compact issuer-signed JWT (typ mandate+jwt), in full."
+        },
+        "cnf": {
+          "$ref": "#/properties/cnf",
+          "description": "The helper's own proof-of-possession key: the helper signs each request with it."
+        },
+        "agent_id": {
+          "type": "string",
+          "description": "RFC 7638 thumbprint of cnf.jwk (required to match)."
+        },
+        "scope": {
+          "$ref": "#/properties/scope",
+          "description": "Every entry must sit inside ONE parent entry: same server, tools a subset, and every parent constraint kept with values a subset (the child may add constraints). An empty scope is allowed and permits nothing."
+        },
+        "deny": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Must contain every parent deny rule; may add more."
+        },
+        "budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Optional; no bigger than the parent's on either limit. Charged as well as (not instead of) the parent's budget.",
+          "properties": {
+            "pupils": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "calls": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
         }
       }
     }

@@ -7,7 +7,10 @@ Every call to POST /tools/call is recorded, ALLOW, DENY and STEP_UP alike, befor
 What an entry holds:
   - the decision record (decision, reason_code, detail, policy_version, mandate_hash, request_hash, ...)
   - who: jti, iss, delegator.principal and the agent key thumbprint (jkt) from the mandate. Read from the verified
-    claims when the issuer signature checks out, otherwise read unverified and marked "verified": false
+    claims when the issuer signature checks out, otherwise read unverified and marked "verified": false.
+    A delegated child (question 7): jti and jkt are the child's (the helper's key), iss, principal and purpose are
+    the parent's, plus parent_jti and chain [parent jti, child jti]; "verified" needs both the parent's issuer
+    signature and the child's signature by the parent's agent key. `select(jti=<parent>)` finds the helper's calls.
   - from where: the client address the gateway saw (and X-Forwarded-For, which anyone can set)
   - what was asked: server, tool, arguments
   - what was released, for forwarded calls: a SUMMARY (HTTP status, row count, column names, the pupil IDs and school
@@ -49,6 +52,7 @@ import jwt
 from fastapi import HTTPException
 from fastapi.responses import JSONResponse, Response
 
+from . import delegation
 from .common import canonical, jwk_thumbprint, pub_to_pem, sha256_hex
 from .gateway_verify import MAX_ROWS, POLICY_VERSION, Request, check_request
 
@@ -211,7 +215,11 @@ def verify_chain(path: Path) -> dict:
 
 def mandate_facts(token: str, registry) -> tuple[dict, dict | None]:
     """Who the mandate names, and the claims if the issuer signature verifies (expiry and revocation aside:
-    an expired or revoked mandate still says truthfully whose access it was). Never raises."""
+    an expired or revoked mandate still says truthfully whose access it was). Never raises.
+    A delegated child: the parent's facts, with the child's jti, key and exp, and the chain; never its claims
+    (None), so no grant read from them (gateway.audit) can come from a child."""
+    if delegation.is_delegated(token):
+        return _child_facts(token, registry), None
     facts: dict[str, Any] = {"verified": False}
     try:
         hdr = jwt.get_unverified_header(token)
@@ -255,6 +263,35 @@ def mandate_facts(token: str, registry) -> tuple[dict, dict | None]:
         exp=c.get("exp") if isinstance(c.get("exp"), int) else None,
     )
     return facts, verified
+
+
+def _child_facts(token: str, registry) -> dict:
+    """[q7] Facts for a delegated child: who granted the access (from the parent) and who used it (the child)."""
+    try:
+        child = jwt.decode(token, options={"verify_signature": False})
+        parent_token = child.get("parent") if isinstance(child, dict) else None
+    except Exception as e:  # noqa: BLE001
+        return {"verified": False, "error": f"unreadable delegated mandate: {type(e).__name__}"}
+    if not isinstance(parent_token, str) or delegation.is_delegated(parent_token):
+        return {"verified": False, "error": "delegated mandate without a usable parent", "delegated": True}
+    facts, parent = mandate_facts(parent_token, registry)
+    signed = delegation.child_signature_ok(token, parent) if parent else None
+    c = signed or child
+    try:
+        jkt = jwk_thumbprint(c["cnf"]["jwk"])
+    except Exception:  # noqa: BLE001
+        jkt = None
+    jti = c.get("jti") if isinstance(c.get("jti"), str) else None
+    return {
+        **facts,
+        "verified": bool(facts.get("verified") and signed),
+        "delegated": True,
+        "jti": jti,
+        "parent_jti": facts.get("jti"),
+        "chain": [facts.get("jti"), jti],
+        "jkt": jkt,
+        "exp": c.get("exp") if isinstance(c.get("exp"), int) else None,
+    }
 
 
 def _strings(obj, depth=0):
@@ -330,8 +367,10 @@ _REASONS = {
     "WRONG_TOKEN_TYPE": "not a mandate",
     "STATUS_UNAVAILABLE": "the cancellation list could not be checked",
     "AUDIT_UNAVAILABLE": "the gateway could not write its log, so it released nothing",
+    "DELEGATION_INVALID": "a helper's mandate that was not properly handed on by the agent holding the original",
+    "DELEGATION_WIDER": "a helper's mandate asked for more than the one it was handed on from",
 }
-_SUSPICIOUS = {"POP_FAILED", "SIG_INVALID"}
+_SUSPICIOUS = {"POP_FAILED", "SIG_INVALID", "DELEGATION_INVALID"}
 
 
 def _when(ts) -> str:
@@ -342,8 +381,10 @@ def _when(ts) -> str:
 
 
 def _key(entry) -> str:
-    jkt = (entry.get("mandate") or {}).get("jkt") or "unknown"
-    return f"agent key {jkt[:6]}…"
+    m = entry.get("mandate") or {}
+    jkt = m.get("jkt") or "unknown"
+    helper = " (a helper, handed on by your agent)" if m.get("delegated") else ""
+    return f"agent key {jkt[:6]}…{helper}"
 
 
 def _ids(ids: list[str], show=5) -> str:
@@ -459,8 +500,8 @@ def select(entries: list[dict], *, principal=None, jti=None, pupil=None, decisio
         m = e.get("mandate") or {}
         if principal is not None and m.get("principal") != principal:
             continue
-        if jti is not None and m.get("jti") != jti:
-            continue
+        if jti is not None and m.get("jti") != jti and jti not in (m.get("chain") or []):
+            continue  # [q7] a parent's jti also finds its helpers' calls
         if decision is not None and (e.get("decision") or {}).get("decision") != decision:
             continue
         if t0 is not None and float(e.get("ts") or 0) < t0:

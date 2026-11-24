@@ -5,6 +5,7 @@ POST /tools/call  {server, tool, arguments, mandate, nonce, ts, sig}
   -> ALLOW: forward to the MCP server, DENY: 403, STEP_UP: 202
   -> a mandate with a `budget` claim (gateway/lib/budget.py): the request is charged before forwarding and the
      result is checked before release; over budget is DENY BUDGET_EXHAUSTED, 403, and nothing is returned
+  -> a delegated child mandate (question 7, gateway/lib/delegation.py) is charged to its own budget and its parent's
 
 GATEWAY_DEMO=1 turns on the /demo walkthrough routes (404 otherwise). They hold the issuer key and an agent key, so
 anyone who can reach them can mint and revoke mandates: a deployed gateway runs with GATEWAY_DEMO unset or 0.
@@ -14,6 +15,7 @@ answers 503 with the reason so a bad deploy fails `docker compose up --wait` (ca
 Mandates without a budget never touch the ledger.
 """
 
+import contextlib
 import dataclasses
 import json
 import logging
@@ -31,7 +33,7 @@ from pydantic import BaseModel, Field
 
 from gateway.cli import sign_request
 from gateway.lib import audit  # AUDIT(q14/q16)
-from gateway.lib.budget import ID_BOUNDED_TOOLS, Budget, Ledger, LedgerUnavailable, parse_budget, pupil_ids
+from gateway.lib.budget import ID_BOUNDED_TOOLS, Budget, Ledger, LedgerUnavailable, chain_budgets, pupil_ids
 from gateway.lib.common import generate_keypair, pub_to_jwk
 from gateway.lib.gateway_verify import MAX_TS, Decision, Gateway, Request, normalised_arguments
 from gateway.lib.nonce_store import NonceStore
@@ -176,13 +178,16 @@ async def tools_call(body: CallBody):
     target = MCP_SERVERS.get(body.server)
     if target is None:
         raise HTTPException(404, f"no MCP server configured for {body.server!r}")
-    budget = parse_budget(claims)  # validated in decide: None or a well-formed budget
-    if budget is None:
+    budgets = chain_budgets(claims)  # validated in decide; a delegated child: its own and its parent's
+    if not budgets:
         return await _forward(target, body, record)
     ledger: Ledger = state["ledger"]
-    # held across forward and charge, so two concurrent calls cannot both fit into the last of the budget
-    async with ledger.lock(budget.key):
-        return await _forward_budgeted(target, body, decision, budget, ledger)
+    # held across forward and charge, so two concurrent calls cannot both fit into the last of the budget.
+    # Several keys (a child and its parent) are locked in one global order, so two calls cannot deadlock.
+    async with contextlib.AsyncExitStack() as held:
+        for key in sorted({b.key for b in budgets}):
+            await held.enter_async_context(ledger.lock(key))
+        return await _forward_budgeted(target, body, decision, budgets, ledger)
 
 
 async def call_upstream(target, body: CallBody) -> tuple[bool, object]:
@@ -201,41 +206,56 @@ async def _forward(target, body: CallBody, record: dict):
     return JSONResponse({"decision": record, "error": payload}, status_code=502)
 
 
+def _whose(budget: Budget) -> str:
+    return "" if budget.label == "mandate" else f"{budget.label} mandate's budget: "  # [q7] which one in a chain
+
+
 def _pupils_detail(ledger: Ledger, budget: Budget, what: str) -> str:
     used = len(ledger.usage(budget.key).pupils)
-    return f"pupils: {what}; {used} of {budget.pupils} distinct pupils used"
+    return f"{_whose(budget)}pupils: {what}; {used} of {budget.pupils} distinct pupils used"
 
 
-def _admit(tool: str, named: set[str], budget: Budget, ledger: Ledger) -> tuple[str, str] | None:
+def _reports(ledger: Ledger, budgets: list[Budget]) -> dict:
+    """`budget`: the first budget's usage (the mandate's own, as before). A delegated child charged to more than one
+    budget also gets `budgets`, each labelled child or parent."""
+    out = {"budget": ledger.report(budgets[0])}
+    if len(budgets) > 1:
+        out["budgets"] = [{"of": b.label, **ledger.report(b)} for b in budgets]
+    return out
+
+
+def _admit(tool: str, named: set[str], budgets: list[Budget], ledger: Ledger) -> tuple[str, str] | None:
     """Charge a budgeted request before forwarding, or say why not as (reason_code, detail). Depends only on the
-    arguments and the ledger, never on the data, so a refusal is not an oracle (budget.py)."""
+    arguments and the ledger, never on the data, so a refusal is not an oracle (budget.py). A delegated child's call
+    must fit every budget in its chain, and is charged to all of them."""
     try:
         ledger.check_available()
-        if not ledger.calls_left(budget):
-            return "BUDGET_EXHAUSTED", f"calls: all {budget.calls} used, not forwarded"
-        if not ledger.fits(budget, named):
-            new = len(ledger.new_pupils(budget, named))
-            return "BUDGET_EXHAUSTED", _pupils_detail(
-                ledger, budget, f"the {new} new pupil(s) named do not fit, not forwarded"
-            )
-        if tool not in ID_BOUNDED_TOOLS and ledger.full(budget):
-            only = f"budget full, only {sorted(ID_BOUNDED_TOOLS)} for pupils already seen; not forwarded"
-            return "BUDGET_EXHAUSTED", _pupils_detail(ledger, budget, only)
-        ledger.charge(budget, named, calls=1)  # persisted before forwarding: an error or a withheld result still costs
+        for budget in budgets:
+            if not ledger.calls_left(budget):
+                return "BUDGET_EXHAUSTED", f"{_whose(budget)}calls: all {budget.calls} used, not forwarded"
+            if not ledger.fits(budget, named):
+                new = len(ledger.new_pupils(budget, named))
+                return "BUDGET_EXHAUSTED", _pupils_detail(
+                    ledger, budget, f"the {new} new pupil(s) named do not fit, not forwarded"
+                )
+            if tool not in ID_BOUNDED_TOOLS and ledger.full(budget):
+                only = f"budget full, only {sorted(ID_BOUNDED_TOOLS)} for pupils already seen; not forwarded"
+                return "BUDGET_EXHAUSTED", _pupils_detail(ledger, budget, only)
+        ledger.charge(budgets, named, calls=1)  # persisted before forwarding: an error or a withheld result still costs
     except LedgerUnavailable as e:
         return "BUDGET_UNAVAILABLE", str(e)
     return None
 
 
-async def _forward_budgeted(target, body: CallBody, decision: Decision, budget: Budget, ledger: Ledger):
+async def _forward_budgeted(target, body: CallBody, decision: Decision, budgets: list[Budget], ledger: Ledger):
     """Charge the request, forward, then check the result (the backstop)."""
 
     def refuse(code: str, detail: str) -> JSONResponse:
         refusal = dataclasses.replace(decision, decision="DENY", reason_code=code, detail=detail)
-        return JSONResponse({"decision": refusal.to_dict(), "budget": ledger.report(budget)}, status_code=403)
+        return JSONResponse({"decision": refusal.to_dict(), **_reports(ledger, budgets)}, status_code=403)
 
     # pupils the request names are charged whether or not they are found
-    if refusal := _admit(body.tool, pupil_ids(body.arguments), budget, ledger):
+    if refusal := _admit(body.tool, pupil_ids(body.arguments), budgets, ledger):
         return refuse(*refusal)
 
     ok, payload = await call_upstream(target, body)
@@ -251,18 +271,18 @@ async def _forward_budgeted(target, body: CallBody, decision: Decision, budget: 
         ]
     # backstop for tools that list pupils without naming them (roster, get). An upstream error is upstream data too.
     returned = pupil_ids(payload)
-    if not ledger.fits(budget, returned):
+    if over := next((b for b in budgets if not ledger.fits(b, returned)), None):
         # says nothing about how many pupils the withheld result held: that would be a count oracle
         withheld = "result withheld, it does not fit; its pupils were not charged"
-        return refuse("BUDGET_EXHAUSTED", _pupils_detail(ledger, budget, withheld))
+        return refuse("BUDGET_EXHAUSTED", _pupils_detail(ledger, over, withheld))
     try:
-        ledger.charge(budget, returned)
+        ledger.charge(budgets, returned)
     except LedgerUnavailable as e:
         return refuse("BUDGET_UNAVAILABLE", str(e))
     record = decision.to_dict()
     if ok:
-        return {"decision": record, "result": payload, "budget": ledger.report(budget)}
-    return JSONResponse({"decision": record, "error": payload, "budget": ledger.report(budget)}, status_code=502)
+        return {"decision": record, "result": payload, **_reports(ledger, budgets)}
+    return JSONResponse({"decision": record, "error": payload, **_reports(ledger, budgets)}, status_code=502)
 
 
 def _demo_enabled() -> None:
