@@ -26,8 +26,9 @@ uv run python -m gateway.cli decode gateway/state/clearance.jwt   # check it is 
 
 - `max_limit` and `columns` are only examples. The names and what they mean are yours.
 - `--claims` refuses a name the mandate already uses (`scope`, `exp`, `cnf` and so on), so it cannot quietly replace
-  one. That now includes `clearance` and `role`: this gateway enforces both, and they have flags of their own
-  (`--clearance` is required, `--role` opens level 4).
+  one. That includes `clearance`, `role` and `role_exp`: this gateway enforces them, and they have flags of their own
+  (`--clearance` is required, `--role safeguarding-lead` lets a level 4 result through, `--role-ttl` ends the role
+  before the mandate ends).
 - Do not put a new field inside `constraints`. Every key there is treated as a request argument that must be present
   and must have one of the listed values.
 - For long JSON, keep it in a file: `--claims "$(cat clearance.json)"`.
