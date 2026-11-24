@@ -57,6 +57,6 @@ None of these are part of the problem. Changing them makes your results meaningl
 - Keep the request shape of `POST /tools/call` unchanged; other teams' tools and the eval depend on it.
 - A mandate cannot be edited. To change one, issue a new one and revoke the old (README, "Changing a mandate").
 - `EXPIRED` locally? Run `make gateway_issue`.
-- Never commit or post `gateway/state/*.pem`. Share only public keys and mandates.
+- Day 2 decision: the gateway state bundle (`issuer_key.pem`, `agent.pem`, `gateway_key.pem`, `gateway.pub`, the status list and the `mandate.jwt`/`feature.jwt` mandates) is committed on purpose so teams attack each other with each other's issuer key — drop another team's bundle into `day_2_attack/targets/<team>/state/`. Runtime churn stays local: never commit `gateway/state/seen_nonces.log`, the `board/` question mandates, or the `demo_*` artifacts.
 - Going straight to `:8080` bypasses the gateway. That is a known hole to reason about, not a way to pass a question.
 - Before finishing a change: `make eval_run`, `make test`, `make lint`.

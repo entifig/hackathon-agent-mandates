@@ -56,9 +56,20 @@ frontend/.env*.local
 frontend/.astro/
 frontend/dist/
 
-# Gateway runtime state (private keys, audit log)
+# Gateway runtime state. Day 2 decision: the key bundle is shared so teams attack each
+# other with each other's issuer key. The shareable files are force-tracked below; the
+# runtime churn (seen_nonces.log, board/ question mandates, demo artifacts) stays local.
 gateway/state/*
 !gateway/state/.gitkeep
+!gateway/state/issuer_key.pem
+!gateway/state/agent.pem
+!gateway/state/gateway_key.pem
+!gateway/state/gateway.pub
+!gateway/state/trusted_list.json
+!gateway/state/status_list.json
+!gateway/state/status_list.jwt
+!gateway/state/mandate.jwt
+!gateway/state/feature.jwt
 
 .pytest_cache/
 .ruff_cache/
