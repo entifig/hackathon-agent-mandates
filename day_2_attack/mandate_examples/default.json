@@ -1,0 +1,59 @@
+{
+  "iss": "https://issuer.hack.local",
+  "jti": "urn:uuid:<random, one per mandate>",
+  "iat": "<unix seconds at issue>",
+  "nbf": "<unix seconds at issue>",
+  "exp": "<iat + 86400>",
+  "vct": "urn:hack:mandate:v1",
+  "delegator": {
+    "principal": "attacker:<team>",
+    "org": "school:SCH01",
+    "authority": "hackathon"
+  },
+  "cnf": {
+    "jwk": {
+      "kty": "OKP",
+      "crv": "Ed25519",
+      "x": "<x from your <team>.jwk>"
+    }
+  },
+  "agent_id": "<thumbprint of that key>",
+  "purpose": "Day 2 attack mandate for <team>",
+  "scope": [
+    {
+      "server": "pupil-data",
+      "tools": [
+        "search"
+      ],
+      "constraints": {
+        "urn": [
+          "SCH01"
+        ]
+      }
+    },
+    {
+      "server": "pupil-data",
+      "tools": [
+        "get"
+      ],
+      "constraints": {
+        "path": [
+          "synthetic/synthetic_schools.csv",
+          "synthetic/synthetic_manifest.json"
+        ]
+      }
+    }
+  ],
+  "deny": [
+    "*.write",
+    "pii.*"
+  ],
+  "status": {
+    "status_list": {
+      "uri": "https://issuer.hack.local/status/1",
+      "idx": "<printed when we issue it; we revoke by this number>"
+    }
+  },
+  "clearance": 4,
+  "role": "safeguarding-lead"
+}
