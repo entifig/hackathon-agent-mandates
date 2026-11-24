@@ -35,9 +35,9 @@ Answers to the page's questions, as we decided them:
   38 pupils, so 40 lets the job finish with a little slack, and repeat lookups cost nothing.
 - **Calls are capped as well**, for probing that names no pupil at all.
 - **Remembered against the person and the job:** the ledger key is `(issuer, delegator.principal, budget.id or
-  jti)`. With no `id`, each mandate has its own budget. An issuer who wants two mandates, or a parent and the helper
-  it delegates to (question 7), to share one budget gives them the same `id`. The agent cannot change this, because
-  the claim is signed.
+  jti)`. With no `id`, each mandate has its own budget. An issuer who wants two mandates to share one budget gives
+  them the same `id`. The agent cannot change this, because the claim is signed. A helper's delegated child
+  (question 7) is charged to its parent's budget automatically.
 - **Charged on the request, not the result.** Our first design forwarded the call and withheld the result if it
   went over. Our own red team broke it: `search` does a substring match over the whole row, so
   `"P0542,M,WHIT,1_ENG,0,1"` was withheld and `"...,0,0"` came back empty. The refusal had told them the pupil

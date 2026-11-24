@@ -2,6 +2,7 @@
 
     receive (request, mandate)
       -> verify mandate: issuer accredited / signature / time / revocation
+         (a delegated child, question 7: its parent all of that, then the child against the parent; delegation.py)
       -> verify proof of possession (request signed by cnf key, fresh nonce and ts; nonces persist: nonce_store.py)
       -> check request against scope, deny and constraints
       -> (budgeted mandates) only requests whose cost is countable; main.tools_call charges the budget (budget.py)
@@ -20,8 +21,10 @@ from dataclasses import asdict, dataclass
 
 import jwt
 
-from .budget import BudgetInvalid, parse_budget, request_refusal
+from . import delegation
+from .budget import BudgetInvalid, chain_budgets, request_refusal
 from .common import canonical, jwk_thumbprint, jwk_to_pub, pub_to_pem, sha256_hex, verify_bytes
+from .delegation import Reject  # one class for every refusal, re-exported here
 from .nonce_store import MAX_NONCE_LEN, TS_WINDOW, NonceStore, NonceStoreUnavailable
 from .status_list import is_revoked
 
@@ -34,12 +37,6 @@ MAX_ROWS = 100
 MAX_ARGS_DEPTH = 8
 MAX_ARGS_BYTES = 16 * 1024
 MAX_TS = 2**41  # unix seconds; far beyond any real clock, far below anything that overflows a float
-
-
-class Reject(Exception):
-    def __init__(self, code: str, detail: str = ""):
-        super().__init__(f"{code}: {detail}")
-        self.code, self.detail = code, detail
 
 
 @dataclass
@@ -96,13 +93,12 @@ def _scope_entry(entry) -> bool:
     )
 
 
-def check_claims_shape(claims: dict) -> None:
-    """Every claim the gateway reads has the type it is read as. A signed mandate can still be malformed (an issuer's
-    mistake, or a key that signs anything): refuse it rather than crash on it."""
+def claim_checks(claims: dict) -> dict[str, bool]:
+    """Claim name -> whether it has the type the gateway reads it as."""
     status = claims.get("status")
     sl = status.get("status_list") if isinstance(status, dict) else None
     cnf = claims.get("cnf")
-    checks = {
+    return {
         "jti": isinstance(claims.get("jti"), str),
         "exp": _number(claims.get("exp")),
         "nbf": "nbf" not in claims or _number(claims["nbf"]),
@@ -113,6 +109,14 @@ def check_claims_shape(claims: dict) -> None:
         "scope": isinstance(claims.get("scope"), list) and all(map(_scope_entry, claims["scope"])),
         "deny": _strings(claims.get("deny")),
     }
+
+
+def check_claims_shape(claims: dict) -> None:
+    """Every claim the gateway reads has the type it is read as. A signed mandate can still be malformed (an issuer's
+    mistake, or a key that signs anything): refuse it rather than crash on it."""
+    checks = claim_checks(claims)
+    # [q7] `parent` is what makes a mandate a delegated child, and only a child (delegation.py) carries one
+    checks["parent"] = "parent" not in claims
     if bad := [name for name, ok in checks.items() if not ok]:
         raise Reject("MANDATE_MALFORMED", f"bad or missing claims {bad}")
 
@@ -124,7 +128,7 @@ def verify_mandate(token: str, registry, status_lists: dict[str, str]) -> dict:
         unverified = jwt.decode(token, options={"verify_signature": False})
     except jwt.PyJWTError as e:
         raise Reject("MANDATE_MALFORMED", str(e))
-    if hdr.get("typ") != "mandate+jwt":
+    if hdr.get("typ") != delegation.MANDATE_TYP:
         raise Reject("WRONG_TOKEN_TYPE", str(hdr.get("typ")))
     iss, kid = unverified.get("iss"), hdr.get("kid", "")
     if not isinstance(iss, str) or not isinstance(kid, str):
@@ -229,6 +233,14 @@ class Gateway:
         # [q11 replay] seen nonces; main.py passes one persisted under GATEWAY_STATE_DIR, default in memory
         self.nonces = nonces if nonces is not None else NonceStore()
 
+    def verify(self, token: str) -> dict:
+        """The verified (effective) claims of an ordinary mandate or of a delegated child. Raises Reject."""
+        if not delegation.is_delegated(token):
+            return verify_mandate(token, self.registry, self.status_lists)
+        return delegation.verify_delegated(  # [q7]
+            token, lambda parent: verify_mandate(parent, self.registry, self.status_lists), time.time(), CLOCK_SKEW
+        )
+
     def decide(self, req: Request) -> Decision:
         return self.decide_with_claims(req)[0]
 
@@ -239,9 +251,10 @@ class Gateway:
         try:
             check_arguments_size(req.arguments)
             base.update(mandate_hash=sha256_hex(req.mandate.encode()), request_hash=sha256_hex(req.signing_input()))
-            claims = verify_mandate(req.mandate, self.registry, self.status_lists)
+            claims = self.verify(req.mandate)
             try:
-                budget = parse_budget(claims)  # a malformed budget is a DENY here, so tools_call only sees valid ones
+                # a malformed budget is a DENY here, so tools_call only sees valid ones. A child: its own and its parent's
+                budgets = chain_budgets(claims)
             except BudgetInvalid as e:
                 raise Reject("BUDGET_INVALID", str(e))
             jwk = claims["cnf"]["jwk"]
@@ -267,7 +280,13 @@ class Gateway:
             # [q11 replay] end
 
             decision, code, detail = check_request(req, claims["scope"], claims["deny"], self.step_up)
-            if budget is not None and decision != "DENY" and (why := request_refusal(req.tool, req.arguments)):
+            if "parent" in claims and decision != "DENY":
+                # [q7] the child is inside its parent (checked at verify); ask the parent anyway, defence in depth
+                parent = claims["parent"]
+                verdict, why, _ = check_request(req, parent["scope"], parent["deny"], self.step_up)
+                if verdict == "DENY":
+                    decision, code, detail = "DENY", "DELEGATION_WIDER", f"the parent mandate refuses this call: {why}"
+            if budgets and decision != "DENY" and (why := request_refusal(req.tool, req.arguments)):
                 decision, code, detail = "DENY", "BUDGET_QUERY", why
             return Decision(decision, code, agent_id=claims["agent_id"], detail=detail, **base), claims
         except Reject as r:

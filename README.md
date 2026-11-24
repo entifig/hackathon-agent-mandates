@@ -168,6 +168,8 @@ Each answer is `200 ALLOW`, `202 STEP_UP` (held for approval, not forwarded) or 
 | `DENIED_BY_RULE` | The tool matches a `deny` glob. Checked before scope |
 | `OUT_OF_SCOPE` | No scope entry lists the tool |
 | `CONSTRAINT_MISSING` / `CONSTRAINT_VIOLATED` | A constrained argument is absent, or its value is not in the allowed list |
+| `DELEGATION_WIDER` | A delegated child (question 7) grants more than its parent: a tool, server, constraint value, dropped constraint or deny rule, a later `exp`, or a bigger budget. Also returned if the request passes the child but not the parent |
+| `DELEGATION_INVALID` | A delegated child that is not signed by its parent's agent key, is malformed, sets a claim it may not (`purpose`, `delegator`, `status`, a budget `id`), is a child of a child, or grants `gateway.audit` |
 
 
 ### Changing a mandate
@@ -199,6 +201,43 @@ The gateway reads the status list on every request, so a revocation applies with
 
 To make a mandate say something new, such as a clearance or a limit, see [docs/new_mandate.md](docs/new_mandate.md):
 `cli issue --claims` signs a claim of your own into the mandate, and the page shows where the gateway reads it.
+
+## Handing a helper less access (question 7)
+
+An agent holding a mandate can hand a helper agent a narrower **child** of it, without going back to the issuer. The
+child is signed with the agent's own key (the parent's `cnf` key), carries the whole parent mandate in a `parent`
+claim, and names the helper's key in its own `cnf`. The code is in
+[gateway/lib/delegation.py](gateway/lib/delegation.py).
+
+```bash
+uv run python -m gateway.cli keygen -o helper.pem > helper.jwk      # helper: make a key, send the JWK
+uv run python -m gateway.cli delegate --mandate gateway/state/mandate.jwt --agent-key gateway/state/agent.pem \
+    --helper-key helper.jwk --ttl 3600 -o child.jwt \
+    --scope '[{"server": "pupil-data", "tools": ["get"], "constraints": {"path": ["synthetic/synthetic_schools.csv"]}}]'
+# wrote delegated mandate urn:uuid:... to child.jwt
+uv run python -m gateway.cli decode child.jwt                       # shows the parent decoded inside it
+uv run python -m gateway.cli call --mandate child.jwt --agent-key helper.pem \
+    --tool get --args '{"path": "synthetic/synthetic_schools.csv"}'
+```
+
+From the starter mandate, that hands on one of its two files and no pupil search. The Dunmore example in
+[question 7](questions/07-delegation.md#what-we-did) hands on a Year 11 roster instead.
+
+`delegate` refuses a child wider than the parent (`--no-check` skips that, to test a gateway). It always keeps the
+parent's deny rules and never lets the child outlive the parent. On every call the gateway:
+
+1. verifies the parent in full, as for any mandate: a revoked or expired parent stops the child at once, with the
+   parent's own reason code;
+2. checks the child is signed by the parent's `cnf` key and names it as `iss`;
+3. checks the child is no wider than the parent: each scope entry inside one parent entry, every parent deny rule
+   kept, `nbf`/`exp` inside the parent's, a budget no bigger;
+4. checks the request against the child, then against the parent again.
+
+Who granted it, and why (`delegator`, `purpose`), come from the parent; a child cannot set them. A child of a child
+is refused (depth 1), as is a child granting `gateway.audit`. A helper's calls are charged to the parent's budget
+(question 11), and to the child's own if it has one. Audit entries name both `jti`s, so
+`cli audit --jti <parent jti>` lists the helper's calls too. To stop a helper, revoke the parent: a child has no status
+entry of its own. A walkthrough is in [questions/07-delegation.md](questions/07-delegation.md#what-we-did).
 
 ## The request log (questions 14 and 16)
 
