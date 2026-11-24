@@ -11,6 +11,7 @@ from fastmcp import FastMCP
 from gateway import cli, main
 from gateway.lib.common import b64u, generate_keypair, priv_from_pem, priv_to_pem, sign_bytes
 from gateway.lib.gateway_verify import Request
+from mcp_server.api.routes_mcp import aggregate as census_aggregate
 
 
 @pytest.fixture
@@ -47,6 +48,11 @@ def isolated_gateway(tmp_path, monkeypatch):
         if (query, urn) == ("P0011", "SCH04"):
             return [{"Psuedo ID": "P0011", "URN": "SCH04", "Ethnicity": "ASIA"}]
         return []
+
+    @upstream.tool
+    def aggregate(table: str, group_by: list[str], measure: str, where: dict[str, str]) -> list[dict]:
+        upstream_calls.append(("aggregate", table, tuple(group_by)))
+        return census_aggregate(table, group_by, measure, where)
 
     monkeypatch.setattr(main, "STATE_DIR", state)
     monkeypatch.setattr(main, "state", {})
@@ -178,3 +184,32 @@ def test_replayed_request_is_denied_after_gateway_state_reload(isolated_gateway)
     replay = client.post("/tools/call", json=body)
     assert (replay.status_code, replay.json()["decision"]["reason_code"]) == (403, "POP_FAILED")
     assert len(calls) == baseline
+
+
+def test_rounded_aggregate_suppresses_one_pupil_care_group(isolated_gateway):
+    client, state, agent, _, _, _, _ = isolated_gateway
+    table = "personal_data_school_census"
+    token, _ = cli.issue_mandate(
+        state,
+        agent.public_key(),
+        scope=[{"server": "pupil-data", "tools": ["aggregate"], "constraints": {"table": [table]}}],
+        deny=cli.DEFAULT_DENY,
+        ttl=3600,
+        purpose="school-wide counts",
+        principal="eval:fixture",
+        org="school:SCH07",
+        extra={"clearance": 4, "role": "safeguarding-lead"},
+    )
+    arguments = {
+        "table": table,
+        "group_by": ["URN", "InCareAtCurrentSchool"],
+        "measure": "FSMeligible",
+        "where": {"URN": "SCH07"},
+    }
+    raw = census_aggregate(**arguments)
+    assert next(row["total"] for row in raw if row["InCareAtCurrentSchool"] == "1") == 5
+    body = cli.sign_request(agent, server="pupil-data", tool="aggregate", arguments=arguments, mandate=token)
+    response = client.post("/tools/call", json=body)
+    assert response.status_code == 200
+    assert response.json()["decision"]["decision"] == "ALLOW"
+    assert not any(row["InCareAtCurrentSchool"] == "1" for row in response.json()["result"])
