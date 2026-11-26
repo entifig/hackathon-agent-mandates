@@ -1172,7 +1172,37 @@ _CATALOG: list[dict] = [
             "measure": "InCareAtCurrentSchool",
             "where": {"URN": NAMED["urn"]},
         },
-        "note": "SCH07 has one in-care pupil; rounding to the nearest 10 should blur the count of one.",
+        "note": "SCH07 has one in-care pupil (five census rows). The count must come back null, not rounded up to 10.",
+    },
+    {
+        "id": "agg-group-of-one-rows",
+        "group": "aggregate",
+        "kind": "info",
+        "needs_mint": True,
+        "title": "in-care pupil at SCH07 described by fine groups",
+        "mandate": {
+            "mint": {
+                "scope": [{"server": SERVER, "tools": ["aggregate"], "constraints": {"table": [CENSUS]}}],
+                "clearance": 4,
+                "role": ROLE,
+            }
+        },
+        "tool": "aggregate",
+        "arguments": {
+            "table": CENSUS,
+            "group_by": [
+                "URN",
+                "InCareAtCurrentSchool",
+                "Gender",
+                "AgeAtStartOfAcademicYear",
+                "AcademicYear",
+                "CensusTerm",
+            ],
+            "measure": "InCareAtCurrentSchool",
+            "where": {"URN": NAMED["urn"], "InCareAtCurrentSchool": "1"},
+        },
+        "note": "Each group is one census row of the one pupil in care. RAN (no rows) is held; DATA means a group "
+        "of one was released, even with its total rounded to 0.",
     },
     {
         "id": "agg-brookmere-meals",

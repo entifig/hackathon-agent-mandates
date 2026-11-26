@@ -486,9 +486,12 @@ const $ = (id) => document.getElementById(id);
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 const show = (v) => (v == null ? "—" : typeof v === "string" ? v : JSON.stringify(v));
 
+// the server puts a per-start token in the page; every POST must carry it back
+const BOARD_TOKEN = document.querySelector('meta[name="board-token"]')?.content || "";
+
 async function getJson(url, options = {}) {
   try {
-    const res = await fetch(url, options);
+    const res = await fetch(url, {...options, headers: {...(options.headers || {}), "x-board-token": BOARD_TOKEN}});
     const body = await res.json();
     if (!res.ok && body && !body.error) body.error = `HTTP ${res.status}`;
     return body;

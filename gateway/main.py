@@ -26,9 +26,9 @@ from gateway.lib.gateway_verify import (
     SMALL_COUNT,
     Gateway,
     Request,
+    release_counts,
     request_levels,
     result_levels,
-    round_counts,
     sensitivity_maps,
     sensitivity_record,
 )
@@ -137,7 +137,8 @@ async def describe() -> dict:
         "step_up_patterns": state["gateway"].step_up,
         "disclosure": {
             "small_count": state["small_count"],
-            "rule": "aggregate totals and counts are rounded to the nearest multiple of small_count",
+            "rule": "aggregate groups under small_count rows are withheld; a count under small_count, or within "
+            "small_count of its total, is null; the rest are rounded to the nearest multiple of small_count",
             "refused_in_aggregates": sorted(IDENTIFIERS),
         },
         "private_data": {
@@ -232,8 +233,13 @@ async def tools_call(body: CallBody):
         return refusal
     data = result.data
     if body.tool == "aggregate":
-        data = round_counts(data, state["small_count"])
+        data, withheld, hidden = release_counts(data, state["small_count"])
         decision.disclosure = {"rounded_to": state["small_count"]}
+        if withheld or hidden:
+            decision.detail = (
+                f"{withheld} groups under {state['small_count']} rows withheld, "
+                f"{hidden} counts under {state['small_count']} or within it of the total hidden"
+            )
     return {"decision": decision.to_dict(), "result": data}
 
 

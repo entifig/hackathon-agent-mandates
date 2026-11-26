@@ -493,9 +493,33 @@ def test_counts_are_rounded_so_two_answers_cannot_be_subtracted(gw, tmp_path):
     school = released(group_by=["URN"], where={"URN": "SCH02"})
     whit = released(group_by=["URN"], where={"URN": "SCH02", "Ethnicity": "WHIT"})
     assert (school[0]["count"], whit[0]["count"]) == (70, 70)
-    # every total and count is a multiple of 10, so no sum or difference of answers comes to 1-9
+    # every total and count released is a multiple of 10, so no sum or difference of answers comes to 1-9;
+    # small groups are withheld and small counts hidden
     cells = released(group_by=["URN", "Ethnicity"])
-    assert all(cell["total"] % 10 == 0 and cell["count"] % 10 == 0 for cell in cells)
+    assert all(cell["total"] >= 10 and cell["total"] % 10 == 0 for cell in cells)
+    assert all(cell["count"] is None or cell["count"] % 10 == 0 for cell in cells)
+
+
+def test_small_groups_and_counts_are_not_released(gw, tmp_path):
+    """Attack lab agg-group-of-one: rounding alone still pointed at the one pupil in care at Greystone."""
+    client, call, state = gw
+    agent = priv_from_pem((state / "agent.pem").read_bytes())
+    mandate = _issue(state, tmp_path / "counts.jwt", 4, _COUNTS_SCOPE, ROLE)
+    care = {"measure": "InCareAtCurrentSchool"}
+
+    # P0586 is five census rows: grouped finely enough, each of their groups used to come back with total 0
+    fine = ["URN", "InCareAtCurrentSchool", "Gender", "AgeAtStartOfAcademicYear", "AcademicYear", "CensusTerm"]
+    r = _aggregate(
+        client, call, agent, mandate, group_by=fine, where={"URN": "SCH07", "InCareAtCurrentSchool": "1"}, **care
+    )
+    assert (r.status_code, r.json()["result"]) == (200, [])
+    assert "withheld" in r.json()["decision"]["detail"]
+
+    # the school total is large, but its in-care count is one pupil: hidden, not rounded up to 10
+    r = _aggregate(client, call, agent, mandate, group_by=[], where={"URN": "SCH07"}, **care)
+    (row,) = r.json()["result"]
+    assert row["total"] >= 10
+    assert row["count"] is None
 
 
 def test_small_count_lives_in_the_gateway(gw, monkeypatch):
